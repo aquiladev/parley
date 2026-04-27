@@ -1,0 +1,14 @@
+{
+  "name": "@parley/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Parley Settlement contract — Foundry project",
+  "scripts": {
+    "build": "forge build",
+    "test": "forge test -vv",
+    "test:gas": "forge test --gas-report",
+    "fmt": "forge fmt",
+    "clean": "forge clean",
+    "deploy:sepolia": "forge script script/Deploy.s.sol --rpc-url sepolia --broadcast --verify"
+  }
+}

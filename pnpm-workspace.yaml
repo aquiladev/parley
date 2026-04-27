@@ -1,0 +1,9 @@
+packages:
+  - "packages/shared"
+  - "packages/user-agent"
+  - "packages/user-agent/mcps/*"
+  - "packages/mm-agent"
+  - "packages/miniapp"
+  # packages/contracts is a Foundry project, not a TS workspace —
+  # its package.json exists only to expose forge commands via pnpm scripts.
+  - "packages/contracts"

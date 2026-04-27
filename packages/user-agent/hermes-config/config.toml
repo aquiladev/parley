@@ -1,0 +1,18 @@
+# Hermes Agent config — see SPEC.md §10.1.
+# Env vars are interpolated by Hermes at startup.
+
+[messaging.telegram]
+enabled = true
+bot_token = "$TELEGRAM_BOT_TOKEN"
+# allowed_users intentionally unset — multi-tenant; per-user authorization
+# is enforced server-side by the privileged-tool validation contract (§4.3).
+
+[llm]
+provider = "openai"            # 0G Compute speaks OpenAI-compatible
+base_url = "$ZG_COMPUTE_ENDPOINT"
+api_key = "$ZG_COMPUTE_KEY"
+model = "qwen3.6-plus"          # candidate; verify function-calling support
+
+[mcp.servers]
+axl = { command = "node", args = ["mcps/axl-mcp/dist/index.js"] }
+og  = { command = "node", args = ["mcps/og-mcp/dist/index.js"] }

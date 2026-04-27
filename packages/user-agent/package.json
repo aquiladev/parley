@@ -1,0 +1,23 @@
+{
+  "name": "@parley/user-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Parley User Agent: Hermes runtime + AXL sidecar + calldata helpers",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx watch axl-sidecar/src/index.ts",
+    "sidecar": "tsx axl-sidecar/src/index.ts",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@parley/shared": "workspace:*",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
