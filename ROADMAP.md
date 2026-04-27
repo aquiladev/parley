@@ -33,14 +33,14 @@ Within a phase, items are listed as outcomes, not tasks. Outcomes are what makes
 
 **Outcomes:**
 
-- [ ] Sepolia RPC endpoint reachable; three Sepolia-funded test wallets created (the user persona's wallet, the MM Agent's hot wallet, and the `parley.eth` parent wallet for ENS operations later)
-- [ ] AXL Go binary built locally; `/topology` returns peer info on a single node
-- [ ] Two AXL nodes hub-and-spoke configuration: each can `/send` to the other and `/recv` returns the message — proves transport works at the protocol level
-- [ ] 0G Compute account provisioned, prepaid balance funded, hello-world inference call returns text via the OpenAI-compatible client
-- [ ] 0G Storage SDK uploads a sample blob and downloads it back; Merkle proof verifies — establishes the SDK works for the eventual reputation flow
-- [ ] `parley.eth` (or chosen alternative) registered on Sepolia ENS via `sepolia.app.ens.domains`. Just registration; no subnames or text records yet.
-- [ ] Uniswap Trading API key obtained from `developers.uniswap.org/dashboard`; sample `/quote` call returns a price for USDC/WETH on Sepolia
-- [ ] WalletConnect project ID obtained; basic browser connect-flow tested with a mobile MetaMask
+- [x] Sepolia RPC endpoint reachable; three Sepolia-funded test wallets created (the user persona's wallet, the MM Agent's hot wallet, and the `parley.eth` parent wallet for ENS operations later)
+- [x] AXL Go binary built locally; `/topology` returns peer info on a single node
+- [x] Two AXL nodes hub-and-spoke configuration: each can `/send` to the other and `/recv` returns the message — proves transport works at the protocol level
+- [x] 0G Compute account provisioned, prepaid balance funded, hello-world inference call returns text via the OpenAI-compatible client
+- [x] 0G Storage SDK uploads a sample blob and downloads it back; Merkle proof verifies — establishes the SDK works for the eventual reputation flow
+- [x] `parley.eth` (or chosen alternative) registered on Sepolia ENS via `sepolia.app.ens.domains`. Just registration; no subnames or text records yet.
+- [x] Uniswap Trading API key obtained from `developers.uniswap.org/dashboard`; sample `/quote` call returns a price for USDC/WETH on Sepolia
+- [x] WalletConnect project ID obtained; basic browser connect-flow tested with a mobile MetaMask
 
 **Demoable state:** every external dependency works in isolation, tested individually. No code yet, just credentials, configs, and proofs in a checkable form (screenshots, transaction hashes, logs).
 

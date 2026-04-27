@@ -9,10 +9,16 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx watch axl-sidecar/src/index.ts",
     "sidecar": "tsx axl-sidecar/src/index.ts",
-    "clean": "rm -rf dist *.tsbuildinfo"
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "phase0:zg-compute": "node --env-file=../../.env --import=tsx scripts/zg-compute-hello.ts",
+    "phase0:zg-storage": "node --env-file=../../.env --import=tsx scripts/zg-storage-roundtrip.ts"
   },
   "dependencies": {
+    "@0gfoundation/0g-ts-sdk": "^1.2.6",
+    "@0glabs/0g-serving-broker": "^0.6.0",
     "@parley/shared": "workspace:*",
+    "ethers": "^6.13.4",
+    "openai": "^4.77.0",
     "viem": "^2.21.0"
   },
   "devDependencies": {
