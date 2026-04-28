@@ -14,6 +14,7 @@
     "clean": "rm -rf dist *.tsbuildinfo"
   },
   "dependencies": {
+    "@0gfoundation/0g-ts-sdk": "^1.2.6",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@parley/shared": "workspace:*",
     "ethers": "^6.13.0",

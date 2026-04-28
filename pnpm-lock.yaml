@@ -140,6 +140,9 @@ importers:
 
   packages/user-agent/mcps/og-mcp:
     dependencies:
+      '@0gfoundation/0g-ts-sdk':
+        specifier: ^1.2.6
+        version: 1.2.6(bufferutil@4.1.0)(ethers@6.16.0(bufferutil@4.1.0)(utf-8-validate@5.0.10))(utf-8-validate@5.0.10)
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0
         version: 1.29.0(zod@3.25.76)

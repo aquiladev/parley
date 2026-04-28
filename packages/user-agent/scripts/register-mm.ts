@@ -9,19 +9,19 @@
 //                              (Phase 3 still has 1 MM; multi-MM Phase 5)
 //   SEPOLIA_RPC_URL
 //
-// What it does (single deployer key, both transactions signed by PARLEY_ROOT):
-//   1. Registry.setSubnodeRecord(parentNode, labelhash, parleyRoot, resolver, 0)
+// What it does (three transactions, all signed by PARLEY_ROOT):
+//   1. Registry.setSubnodeRecord(parentNode, labelhash, PARLEY_ROOT, resolver, 0)
 //      — creates (or re-owns) the subname, points it at the same resolver
-//        parley.eth uses, leaves PARLEY_ROOT as owner (so this script can
-//        re-run idempotently without involving the MM key).
-//   2. Resolver.multicall([
-//        setAddr(subnode, mmEvmAddress),
-//        setText(subnode, "axl_pubkey",          axlPubkey),
-//        setText(subnode, "agent_capabilities",  capsJson),
-//      ])
-//      — sets the three records the verifier consumes (SPEC §4.4). Empty
-//        records (reputation_root, avatar) are skipped — Phase 4 sets
+//        parley.eth uses. PARLEY_ROOT keeps ownership for the next step so
+//        it can write records.
+//   2. Resolver.multicall([setAddr, setText('axl_pubkey'), setText('agent_capabilities')])
+//      — sets the records the verifier consumes (SPEC §4.4). Empty records
+//        (reputation_root, avatar) are skipped — Phase 4's MM Agent writes
 //        reputation_root after the first trade.
+//   3. Registry.setOwner(subnode, MM_EVM)
+//      — transfers ownership to the MM. Now MM_EVM can update its own
+//        reputation_root via Resolver.setText. Phase 4B requirement.
+//        PARLEY_ROOT (parent owner) can always reclaim via setSubnodeOwner.
 // Run: pnpm -F @parley/user-agent phase3:register-mm
 
 import {
@@ -46,6 +46,7 @@ const REGISTRY_ABI = parseAbi([
   "function owner(bytes32 node) view returns (address)",
   "function resolver(bytes32 node) view returns (address)",
   "function setSubnodeRecord(bytes32 node, bytes32 label, address owner, address resolver, uint64 ttl)",
+  "function setOwner(bytes32 node, address owner)",
 ]);
 
 const RESOLVER_ABI = parseAbi([
@@ -142,6 +143,8 @@ log({ event: "resolver", address: resolverAddress });
 
 // ---- 2. Create / re-own the subname --------------------------------------
 
+// Step 1: create the subname owned by PARLEY_ROOT (so this script can
+// keep going without involving the MM key).
 const txCreate = await walletClient.writeContract({
   address: REGISTRY,
   abi: REGISTRY_ABI,
@@ -178,7 +181,31 @@ const txRecords = await walletClient.writeContract({
 await publicClient.waitForTransactionReceipt({ hash: txRecords, confirmations: 1 });
 log({ event: "records_set", tx: txRecords });
 
-// ---- 4. Re-resolve to confirm --------------------------------------------
+// ---- 4. Transfer subname ownership to MM_EVM -----------------------------
+// Phase 4B: MM updates its own reputation_root after each trade, which
+// requires owning (or being approved on) the subname.
+
+const currentOwner = (await publicClient.readContract({
+  address: REGISTRY,
+  abi: REGISTRY_ABI,
+  functionName: "owner",
+  args: [subnode],
+})) as Hex;
+
+if (currentOwner.toLowerCase() === mmEvmAddress.toLowerCase()) {
+  log({ event: "ownership_already_mm", owner: currentOwner });
+} else {
+  const txTransfer = await walletClient.writeContract({
+    address: REGISTRY,
+    abi: REGISTRY_ABI,
+    functionName: "setOwner",
+    args: [subnode, mmEvmAddress],
+  });
+  await publicClient.waitForTransactionReceipt({ hash: txTransfer, confirmations: 1 });
+  log({ event: "ownership_transferred_to_mm", tx: txTransfer, new_owner: mmEvmAddress });
+}
+
+// ---- 5. Re-resolve to confirm --------------------------------------------
 
 const [resolvedAddr, resolvedAxl, resolvedCaps] = await Promise.all([
   publicClient.getEnsAddress({ name: MM_ENS_NAME }),

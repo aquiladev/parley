@@ -56,5 +56,50 @@ const r4 = await client.callTool({
 });
 console.log(JSON.stringify(r4, null, 2));
 
+// Optional: full round-trip if OG_PRIVATE_KEY is set. Costs ~0.0001 OG and
+// requires the SDK to talk to the Galileo storage indexer. Skipped otherwise
+// so the smoke test stays cheap.
+if (process.env["OG_PRIVATE_KEY"]) {
+  console.log("\n=== write_trade_record (OG_PRIVATE_KEY set; doing real upload) ===");
+  const fakeRecord = {
+    trade_id: "0x" + "ab".repeat(32),
+    timestamp: Date.now(),
+    user_agent: "0xabcdef1234567890abcdef1234567890abcdef12",
+    mm_agent: "0x7741114B2e5f7ff976660A00b2B548245C672B64",
+    pair: "USDC/WETH",
+    amount_a: "50000000",
+    amount_b: "16633399867199000",
+    negotiated_price: "3006.0",
+    user_locked: true,
+    user_locked_at: Date.now() - 1000,
+    mm_locked: true,
+    mm_locked_at: Date.now() - 500,
+    settled: true,
+    settlement_block: 12345678,
+    defaulted: "none",
+    user_signature: "0x" + "11".repeat(65),
+    mm_signature: "0x" + "22".repeat(65),
+  };
+  const r = await client.callTool({
+    name: "write_trade_record",
+    arguments: { record: fakeRecord, mm_ens_name: "mm-1.parley.eth" },
+  });
+  console.log(JSON.stringify(r, null, 2));
+  console.log("\n=== read_user_reputation (after one settled record) ===");
+  const r2 = await client.callTool({
+    name: "read_user_reputation",
+    arguments: { wallet_address: fakeRecord.user_agent },
+  });
+  console.log(JSON.stringify(r2, null, 2));
+  console.log("\n=== read_mm_reputation (after one settled record) ===");
+  const r3 = await client.callTool({
+    name: "read_mm_reputation",
+    arguments: { ens_name: "mm-1.parley.eth" },
+  });
+  console.log(JSON.stringify(r3, null, 2));
+} else {
+  console.log("\n(write_trade_record skipped: set OG_PRIVATE_KEY to exercise the upload path)");
+}
+
 await client.close();
 console.log("\n[og-mcp] smoke test ok");
