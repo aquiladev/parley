@@ -11,8 +11,7 @@
     "sidecar": "node --env-file=../../.env --import=tsx axl-sidecar/src/index.ts",
     "clean": "rm -rf dist *.tsbuildinfo",
     "phase0:zg-compute": "node --env-file=../../.env --import=tsx scripts/zg-compute-hello.ts",
-    "phase0:zg-storage": "node --env-file=../../.env --import=tsx scripts/zg-storage-roundtrip.ts",
-    "phase1:trade": "node --env-file=../../.env --import=tsx scripts/phase1-trade.ts"
+    "phase0:zg-storage": "node --env-file=../../.env --import=tsx scripts/zg-storage-roundtrip.ts"
   },
   "dependencies": {
     "@0gfoundation/0g-ts-sdk": "^1.2.6",

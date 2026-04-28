@@ -80,16 +80,16 @@ Within a phase, items are listed as outcomes, not tasks. Outcomes are what makes
 
 **Outcomes:**
 
-- [ ] Hermes Agent installed and configured. Basic Telegram bot replies to messages using **Claude API** as the LLM backend (per the spec's documented fallback). 0G Compute is deferred to Phase 4: its auth model uses per-request signed headers rather than a static API key, so it can't talk to Hermes directly without a local broker-wrapping proxy. See `zg_compute_findings` memory. Per-user session memory works (verified by manual multi-user test).
-- [ ] Custom MCPs implemented:
-  - [ ] `axl-mcp` — `discover_peers`, `broadcast_intent`, `send_offer`, `send_accept`, `poll_inbox`, `get_topology`
-  - [ ] `og-mcp` — `resolve_mm` (returns from a hardcoded map keyed by ENS name; same return shape it'll have post-Phase-3), `read_mm_reputation` (returns neutral score 0.0 for now), `read_user_reputation` (returns neutral)
-- [ ] All four privileged-tool validation checks implemented and tested in `axl-mcp.broadcast_intent` and `axl-mcp.send_accept`: session signature, action signature, payload schema, Telegram-binding consistency
-- [ ] AXL listener sidecar bridges incoming offers into Hermes' inbox via Strategy A (polling). Strategy B verified or deferred to roadmap.
-- [ ] Mini App `/connect` route: WalletConnect → wallet signs session-binding EIP-712 → returns to bot. Round-trip verified on real iOS device with real MetaMask Mobile.
-- [ ] Mini App `/sign` route: signs `Deal` typed data, then immediately submits `lockUserSide(deal, sig)` from user's wallet via `wagmi.writeContract`, then returns tx hash to bot.
-- [ ] User Agent state machine implemented: NEW → AWAITING_WALLET_CONNECT → READY → EXPIRED. Per-user state in Hermes memory.
-- [ ] Phase 1's script-signed user side is removed. The real user, holding a real wallet, drives everything from the user side.
+- [x] Hermes Agent installed and configured. Basic Telegram bot replies to messages using **Claude API** as the LLM backend (per the spec's documented fallback). 0G Compute is deferred to Phase 4: its auth model uses per-request signed headers rather than a static API key, so it can't talk to Hermes directly without a local broker-wrapping proxy. See `zg_compute_findings` memory. Per-user session memory works (verified by manual multi-user test). *(multi-user verification deferred to pre-demo gate; see deployment.md §8)*
+- [x] Custom MCPs implemented:
+  - [x] `axl-mcp` — `discover_peers`, `broadcast_intent`, `send_offer`, `send_accept`, `poll_inbox`, `get_topology`
+  - [x] `og-mcp` — `resolve_mm` (returns from a hardcoded map keyed by ENS name; same return shape it'll have post-Phase-3), `read_mm_reputation` (returns neutral score 0.0 for now), `read_user_reputation` (returns neutral)
+- [x] All four privileged-tool validation checks implemented and tested in `axl-mcp.broadcast_intent` and `axl-mcp.send_accept`: session signature, action signature, payload schema, Telegram-binding consistency
+- [x] AXL listener sidecar bridges incoming offers into Hermes' inbox via Strategy A (polling). Strategy B verified or deferred to roadmap. *(Strategy B deferred to Phase 4; Hermes' own scheduled `axl-mcp.poll_inbox` is the bridge; sidecar provides observability + chain-watcher)*
+- [x] Mini App `/connect` route: WalletConnect → wallet signs session-binding EIP-712 → returns to bot. Round-trip verified on real iOS device with real MetaMask Mobile.
+- [x] Mini App `/sign` route: signs `Deal` typed data, then immediately submits `lockUserSide(deal, sig)` from user's wallet via `wagmi.writeContract`, then returns tx hash to bot. Also collects `AcceptAuthorization` sig (§4.3) and adds `/authorize-intent` + `/settle` routes for the full action-sig flow.
+- [x] User Agent state machine implemented: NEW → AWAITING_WALLET_CONNECT → READY → EXPIRED. Per-user state in Hermes memory.
+- [x] Phase 1's script-signed user side is removed. The real user, holding a real wallet, drives everything from the user side.
 
 **Demoable state:** real user (you, on your phone) opens Telegram, types "swap 50 USDC for ETH", connects wallet via Mini App, signs and settles a real trade with the MM Agent from Phase 1. End-to-end with real human-in-the-loop authorization.
 

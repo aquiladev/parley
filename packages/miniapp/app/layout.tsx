@@ -1,6 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
-import { Providers } from "./providers";
+import { ProvidersClient } from "./providers-client";
 
 export const metadata: Metadata = {
   title: "Parley",
@@ -20,7 +20,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         <script src="https://telegram.org/js/telegram-web-app.js" async />
       </head>
       <body>
-        <Providers>{children}</Providers>
+        <ProvidersClient>{children}</ProvidersClient>
       </body>
     </html>
   );
