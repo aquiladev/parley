@@ -25,6 +25,7 @@ import {
 } from "@parley/shared";
 import { sendResult } from "../../lib/telegram";
 import { SEPOLIA_CHAIN_ID } from "../../lib/walletconnect";
+import { MiniAppHeader } from "../../lib/header";
 
 const SESSION_LIFETIME_SECONDS = 24 * 3600;
 
@@ -179,6 +180,7 @@ const btn: React.CSSProperties = {
 function Page({ children }: { children: React.ReactNode }) {
   return (
     <main style={{ padding: 24, fontFamily: "system-ui", lineHeight: 1.5, maxWidth: 480 }}>
+      <MiniAppHeader />
       {children}
     </main>
   );

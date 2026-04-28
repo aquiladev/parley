@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="Parley — the agent layer for peer DeFi">
+  <rect width="1200" height="630" fill="#0F0F12"/>
+  <g transform="translate(500.0 160)">
+    <g fill="none" stroke="#FFFFFF" stroke-linecap="round">
+  <path d="M 86.000 32.000 A 68.000 68.000 0 0 0 86.000 168.000" stroke-width="20.000"/>
+  <path d="M 114.000 32.000 A 68.000 68.000 0 0 1 114.000 168.000" stroke-width="11.765"/>
+</g>
+  </g>
+  <text x="600.0" y="430" text-anchor="middle" dominant-baseline="central"
+        font-family='system-ui, -apple-system, "Segoe UI", Inter, "Helvetica Neue", Arial, sans-serif' font-size="78" font-weight="500"
+        letter-spacing="6" fill="#FFFFFF">parley</text>
+  <text x="600.0" y="500" text-anchor="middle" dominant-baseline="central"
+        font-family='system-ui, -apple-system, "Segoe UI", Inter, "Helvetica Neue", Arial, sans-serif' font-size="26" font-weight="400"
+        letter-spacing="1" fill="#FFFFFF" opacity="0.7">the agent layer for peer DeFi</text>
+</svg>

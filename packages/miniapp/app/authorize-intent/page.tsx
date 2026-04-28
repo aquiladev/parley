@@ -25,6 +25,7 @@ import {
 } from "@parley/shared";
 import { sendResult } from "../../lib/telegram";
 import { SEPOLIA_CHAIN_ID } from "../../lib/walletconnect";
+import { MiniAppHeader } from "../../lib/header";
 
 function AuthIntentInner() {
   const params = useSearchParams();
@@ -207,6 +208,7 @@ const list: React.CSSProperties = {
 function Page({ children }: { children: React.ReactNode }) {
   return (
     <main style={{ padding: 24, fontFamily: "system-ui", lineHeight: 1.5, maxWidth: 480 }}>
+      <MiniAppHeader />
       {children}
     </main>
   );

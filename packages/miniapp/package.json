@@ -4,6 +4,7 @@
   "private": true,
   "description": "Parley Telegram Mini App — wallet signing + tx submission surface",
   "scripts": {
+    "sync-assets": "rm -rf public/favicon public/social && cp -R ../../artifacts/favicon public/favicon && cp -R ../../artifacts/social public/social && cp ../../artifacts/svg/lockup-horizontal.svg public/lockup-horizontal.svg && cp ../../artifacts/svg/mark.svg public/mark.svg",
     "dev": "next dev -p 3000",
     "build": "next build",
     "start": "next start -p 3000",

@@ -1,4 +1,9 @@
-# Parley
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="artifacts/svg/mark-on-dark.svg">
+    <img src="artifacts/svg/lockup-stacked.svg" alt="Parley" width="220">
+  </picture>
+</p>
 
 **The agent layer for peer DeFi.** AI-driven counterparties negotiate trades over an encrypted P2P mesh and settle atomically on Ethereum.
 
