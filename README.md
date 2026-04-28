@@ -36,13 +36,13 @@ sequenceDiagram
     User->>UA: "swap 50 USDC for ETH"
     UA->>AXL: broadcast Intent
     AXL->>MM: deliver Intent
-    Note over MM: price = TWAP × (1 + spread),<br/>check inventory,<br/>sign Deal (EIP-712)
+    Note over MM: price = TWAP * (1 + spread), check inventory, sign Deal
     MM->>AXL: send Offer + signed Deal
     AXL->>UA: deliver Offer
     UA->>User: present offer
     User->>App: sign Deal (EIP-712)
     App->>SC: lockUserSide(deal, userSig)
-    Note over MM,SC: MM watches chain;<br/>fires lockMMSide once UserLocked
+    Note over MM,SC: MM watches chain, fires lockMMSide once UserLocked
     MM->>SC: lockMMSide(deal, mmSig)
     User->>App: tap "settle"
     App->>SC: settle(dealHash)
