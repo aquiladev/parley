@@ -84,6 +84,7 @@ export function buildOffer(
     id: randomUUID(),
     intent_id: intent.id,
     mm_agent_id: cfg.mmAddress,
+    mm_ens_name: cfg.mmEnsName,
     price: formatPriceUsdcPerWeth(ourPrice),
     amount: intent.amount,
     expiry: deadline,

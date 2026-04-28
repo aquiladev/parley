@@ -1,9 +1,8 @@
 // og-mcp — MCP server for 0G Storage reads/writes + ENS resolution.
 // SPEC §4.3, §4.4, §7.
 //
-// Phase 2 status:
-//   - resolve_mm:           hardcoded map keyed by ENS name. Same return
-//                           shape as the post-Phase-3 viem-based resolver.
+// Phase 3 status:
+//   - resolve_mm:           real on-chain ENS resolution via viem.
 //   - read_mm_reputation:   returns neutral 0.0 (Phase 4 implements §7.3 scoring).
 //   - read_user_reputation: returns neutral 0.0 (same).
 //
@@ -15,30 +14,26 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import type { Hex } from "viem";
+import { createPublicClient, http, type Hex } from "viem";
+import { sepolia } from "viem/chains";
+import { normalize } from "viem/ens";
+
+const SEPOLIA_RPC_URL = process.env["SEPOLIA_RPC_URL"];
+if (!SEPOLIA_RPC_URL) {
+  process.stderr.write("[og-mcp] SEPOLIA_RPC_URL is required for ENS resolution\n");
+  process.exit(1);
+}
+
+const client = createPublicClient({ chain: sepolia, transport: http(SEPOLIA_RPC_URL) });
 
 interface MmResolution {
   ens_name: string;
-  addr: Hex;
-  axl_pubkey: string; // full 64-hex ed25519 pubkey
-  agent_capabilities: { chain: string; pairs: string[] };
-  reputation_root: Hex | null;
+  addr: Hex | null;
+  axl_pubkey: string | null;
+  agent_capabilities: { chain?: string; pairs?: string[]; version?: string } | string | null;
+  reputation_root: string | null;
   avatar: string | null;
 }
-
-// Phase 2 hardcoded map. Phase 3 replaces this body with viem.getEnsAddress
-// + getEnsText. Same return shape — no caller changes needed.
-const MM_RESOLUTIONS: Record<string, MmResolution> = {
-  "mm-1.parley.eth": {
-    ens_name: "mm-1.parley.eth",
-    addr: "0x7741114B2e5f7ff976660A00b2B548245C672B64",
-    axl_pubkey:
-      "1edb9063f1e26aec0ea50ed903635692754ee2479e2fa0d66397de31cbdfd2d9",
-    agent_capabilities: { chain: "sepolia", pairs: ["USDC/WETH"] },
-    reputation_root: null,
-    avatar: null,
-  },
-};
 
 const server = new McpServer({ name: "parley-og-mcp", version: "0.1.0" });
 
@@ -46,25 +41,89 @@ server.registerTool(
   "resolve_mm",
   {
     description:
-      "Resolve a Parley MM ENS subname (e.g., mm-1.parley.eth) to its EVM address, AXL public key, capabilities, and reputation root. Phase 2: hardcoded map; Phase 3: real on-chain ENS resolution.",
+      "Resolve a Parley MM ENS subname (e.g., mm-1.parley.eth) on Sepolia to its EVM address, AXL public key, capabilities JSON, and reputation root. Reads via viem.getEnsAddress + getEnsText. Returns isError if the name has no resolver or the addr record is unset.",
     inputSchema: { ens_name: z.string() },
   },
   async ({ ens_name }) => {
-    const r = MM_RESOLUTIONS[ens_name];
-    if (!r) {
+    let name: string;
+    try {
+      name = normalize(ens_name);
+    } catch (err) {
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ error: "unknown_mm", ens_name }, null, 2),
+            text: JSON.stringify(
+              { error: "invalid_ens_name", ens_name, message: (err as Error).message },
+              null,
+              2,
+            ),
           },
         ],
         isError: true,
       };
     }
-    return {
-      content: [{ type: "text", text: JSON.stringify(r, null, 2) }],
-    };
+
+    try {
+      const [addr, axlPubkey, capabilitiesText, reputationRoot, avatar] = await Promise.all([
+        client.getEnsAddress({ name }),
+        client.getEnsText({ name, key: "axl_pubkey" }),
+        client.getEnsText({ name, key: "agent_capabilities" }),
+        client.getEnsText({ name, key: "reputation_root" }),
+        client.getEnsText({ name, key: "avatar" }),
+      ]);
+
+      if (!addr) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { error: "no_addr_record", ens_name },
+                null,
+                2,
+              ),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      let capabilities: MmResolution["agent_capabilities"] = capabilitiesText;
+      if (capabilitiesText) {
+        try {
+          capabilities = JSON.parse(capabilitiesText);
+        } catch {
+          // leave as raw string if it's not JSON
+        }
+      } else {
+        capabilities = null;
+      }
+
+      const result: MmResolution = {
+        ens_name,
+        addr,
+        axl_pubkey: axlPubkey ?? null,
+        agent_capabilities: capabilities,
+        reputation_root: reputationRoot ?? null,
+        avatar: avatar ?? null,
+      };
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "resolution_error", ens_name, message: (err as Error).message },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
   },
 );
 

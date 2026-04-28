@@ -32,9 +32,17 @@ void ACCEPT_AUTHORIZATION_EIP712_TYPES; // reserved for send_accept tests
 const here = dirname(fileURLToPath(import.meta.url));
 const serverPath = resolve(here, "..", "dist", "index.js");
 
+// MCP SDK's StdioClientTransport spawns with a sanitized env by default.
+// Pass through the parent's env so the axl-mcp child gets KNOWN_MM_ENS_NAMES,
+// SEPOLIA_RPC_URL, etc.
+const env: Record<string, string> = {};
+for (const [k, v] of Object.entries(process.env)) {
+  if (typeof v === "string") env[k] = v;
+}
 const transport = new StdioClientTransport({
   command: "node",
   args: [serverPath],
+  env,
 });
 const client = new Client({ name: "axl-mcp-smoke", version: "0.1.0" });
 await client.connect(transport);

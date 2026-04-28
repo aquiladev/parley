@@ -21,7 +21,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import type { Hex } from "viem";
+import { createPublicClient, http, type Hex } from "viem";
+import { sepolia } from "viem/chains";
+import { normalize } from "viem/ens";
 
 import { AxlClient } from "./axl-client.js";
 import {
@@ -37,16 +39,59 @@ import {
 // ---------------------------------------------------------------------------
 
 const AXL_HTTP_URL = process.env["USER_AXL_HTTP_URL"] ?? "http://localhost:9002";
-const KNOWN_MM_AXL_PUBKEYS = (process.env["KNOWN_MM_AXL_PUBKEYS"] ?? "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
 const KNOWN_MM_ENS_NAMES = (process.env["KNOWN_MM_ENS_NAMES"] ?? "mm-1.parley.eth")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+const SEPOLIA_RPC_URL = process.env["SEPOLIA_RPC_URL"];
 
 const axl = new AxlClient(AXL_HTTP_URL);
+// Lazy: only create the chain client when ENS resolution is actually needed.
+// axl-mcp can otherwise run without a Sepolia RPC (poll_inbox, get_topology,
+// the privileged tools' validation logic — none touch the chain).
+let cachedChainClient: ReturnType<typeof createPublicClient> | null = null;
+function chainClient() {
+  if (cachedChainClient) return cachedChainClient;
+  if (!SEPOLIA_RPC_URL) {
+    throw new Error("SEPOLIA_RPC_URL is required for ENS resolution");
+  }
+  cachedChainClient = createPublicClient({ chain: sepolia, transport: http(SEPOLIA_RPC_URL) });
+  return cachedChainClient;
+}
+
+interface ResolvedPeer {
+  ens_name: string;
+  addr?: Hex;
+  axl_pubkey?: string;
+  error?: string;
+}
+
+async function resolveAllPeers(): Promise<ResolvedPeer[]> {
+  const client = chainClient();
+  return Promise.all(
+    KNOWN_MM_ENS_NAMES.map(async (rawName): Promise<ResolvedPeer> => {
+      let name: string;
+      try {
+        name = normalize(rawName);
+      } catch (err) {
+        return { ens_name: rawName, error: `invalid_ens_name: ${(err as Error).message}` };
+      }
+      try {
+        const [addr, axlPubkey] = await Promise.all([
+          client.getEnsAddress({ name }),
+          client.getEnsText({ name, key: "axl_pubkey" }),
+        ]);
+        if (!addr) return { ens_name: rawName, error: "no_addr_record" };
+        if (!axlPubkey) {
+          return { ens_name: rawName, addr, error: "no_axl_pubkey_text_record" };
+        }
+        return { ens_name: rawName, addr, axl_pubkey: axlPubkey };
+      } catch (err) {
+        return { ens_name: rawName, error: `resolution_error: ${(err as Error).message}` };
+      }
+    }),
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Shared zod fragments
@@ -108,15 +153,24 @@ server.registerTool(
   "discover_peers",
   {
     description:
-      "Return the list of MM Agents this User Agent knows about. Phase 2: hardcoded from KNOWN_MM_AXL_PUBKEYS env. Phase 3: ENS-resolved via og-mcp.resolve_mm. Pair entries match KNOWN_MM_ENS_NAMES order.",
+      "Return the list of MM Agents this User Agent knows about, resolved live from Sepolia ENS. Reads KNOWN_MM_ENS_NAMES env, resolves each in parallel via viem.getEnsAddress + getEnsText('axl_pubkey'), returns {ens_name, addr, axl_pubkey} per peer. Names that fail to resolve (no addr or no axl_pubkey record) are surfaced with an `error` field rather than dropped silently.",
     inputSchema: {},
   },
   async () => {
-    const peers = KNOWN_MM_AXL_PUBKEYS.map((axl_pubkey, i) => ({
-      ens_name: KNOWN_MM_ENS_NAMES[i] ?? null,
-      axl_pubkey,
-    }));
-    return { content: [{ type: "text", text: JSON.stringify({ peers }, null, 2) }] };
+    try {
+      const peers = await resolveAllPeers();
+      return { content: [{ type: "text", text: JSON.stringify({ peers }, null, 2) }] };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: (err as Error).message }, null, 2),
+          },
+        ],
+        isError: true,
+      };
+    }
   },
 );
 
@@ -212,16 +266,21 @@ server.registerTool(
         authTelegramUserId: params.intent_auth.telegram_user_id,
         toolCallTelegramUserId: params.telegram_user_id,
       });
-      // Side effect: fan out to known peers.
+      // Side effect: resolve peers via ENS and fan out.
       const body = JSON.stringify(params.intent);
-      const sent: string[] = [];
+      const sent: Array<{ ens_name: string; axl_pubkey: string }> = [];
       const errors: Array<{ peer: string; err: string }> = [];
-      for (const peer of KNOWN_MM_AXL_PUBKEYS) {
+      const resolved = await resolveAllPeers();
+      for (const peer of resolved) {
+        if (peer.error || !peer.axl_pubkey) {
+          errors.push({ peer: peer.ens_name, err: peer.error ?? "no_axl_pubkey" });
+          continue;
+        }
         try {
-          await axl.send(peer, body);
-          sent.push(peer);
+          await axl.send(peer.axl_pubkey, body);
+          sent.push({ ens_name: peer.ens_name, axl_pubkey: peer.axl_pubkey });
         } catch (e) {
-          errors.push({ peer, err: (e as Error).message });
+          errors.push({ peer: peer.ens_name, err: (e as Error).message });
         }
       }
       return {

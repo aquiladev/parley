@@ -10,9 +10,16 @@ import { dirname, resolve } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const serverPath = resolve(here, "..", "dist", "index.js");
 
+// MCP SDK's StdioClientTransport spawns with a sanitized env by default;
+// pass through the parent's env so the og-mcp child gets SEPOLIA_RPC_URL.
+const env: Record<string, string> = {};
+for (const [k, v] of Object.entries(process.env)) {
+  if (typeof v === "string") env[k] = v;
+}
 const transport = new StdioClientTransport({
   command: "node",
   args: [serverPath],
+  env,
 });
 const client = new Client({ name: "og-mcp-smoke", version: "0.1.0" });
 await client.connect(transport);

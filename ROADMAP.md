@@ -106,12 +106,12 @@ Within a phase, items are listed as outcomes, not tasks. Outcomes are what makes
 
 **Outcomes:**
 
-- [ ] MM registration script (`packages/contracts/scripts/register-mm.ts`) written and exercised. Mints `mm-1.parley.eth` on Sepolia ENS with `addr`, `axl_pubkey`, `agent_capabilities`, and `reputation_root` (empty for now) text records set.
-- [ ] `og-mcp.resolve_mm` body replaced with real `viem`-based ENS resolution (the code from §4.4 of the spec). The hardcoded map fallback is removed.
-- [ ] User Agent's `axl-mcp.discover_peers()` reads `KNOWN_MM_ENS_NAMES` env var, resolves each in parallel via `og-mcp.resolve_mm`, builds the same internal data structure that the hardcoded version produced in Phase 2.
-- [ ] Verification on offer arrival exercises real ENS data: `X-From-Peer-Id` matches the resolved `axl_pubkey` text record; EIP-712 signature on deal terms matches the resolved `addr`. Both checks pass against the real chain.
-- [ ] Telegram offer card displays the real ENS name (which now exists on-chain).
-- [ ] Optional: `/register <handle>` opt-in user flow if there's spare time. Implementation is the same shape as the MM registration script but invoked from the bot/Mini App. Likely better as a Phase 5 polish item.
+- [x] MM registration script (`packages/user-agent/scripts/register-mm.ts`; spec said `packages/contracts/scripts/` but contracts is Foundry-only — script lives where the existing Phase-N scripts do). Exercised on Sepolia: `mm-1.parley.eth` is registered with `addr`, `axl_pubkey`, `agent_capabilities` text records set. `reputation_root` deliberately not set yet — Phase 4 sets it after the first trade rather than initializing to a placeholder.
+- [x] `og-mcp.resolve_mm` body replaced with real `viem`-based ENS resolution. The hardcoded map fallback is removed; unknown names return `isError: true` with a structured error code, no quiet fallback.
+- [x] User Agent's `axl-mcp.discover_peers()` reads `KNOWN_MM_ENS_NAMES` env var and resolves each in parallel via `viem.getEnsAddress` + `getEnsText("axl_pubkey")`, returning `{ens_name, addr, axl_pubkey}` per peer (same shape as Phase 2). Names that fail to resolve are surfaced with an `error` field rather than dropped silently. `KNOWN_MM_AXL_PUBKEYS` env var dropped — derived from ENS now.
+- [x] Verification on offer arrival exercises real ENS data: `X-From-Peer-Id` matches the resolved `axl_pubkey` text record; EIP-712 signature on deal terms matches the resolved `addr`. Both checks pass against the real chain. *(Verification logic lives in Hermes' SOUL.md per §4.4; the resolver provides the data.)*
+- [x] Telegram offer card displays the real ENS name (which now exists on-chain). *(`Offer.mm_ens_name` field added to `@parley/shared`; MM Agent populates from `MM_ENS_NAME` env.)*
+- [ ] Optional: `/register <handle>` opt-in user flow if there's spare time. Implementation is the same shape as the MM registration script but invoked from the bot/Mini App. Likely better as a Phase 5 polish item. *(Deferred to Phase 5 polish per the original roadmap note.)*
 
 **Demoable state:** the system architecturally matches the spec. An external observer auditing the system would find that the offer card's `mm-1.parley.eth` resolves on-chain, the verification checks are real, and the discovery mechanism is what's documented.
 

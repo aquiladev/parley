@@ -9,7 +9,7 @@
 
 ## Demo
 
-**Phase 1 — terminal-only end-to-end trade on Sepolia.**
+**Phase 1 — terminal-only end-to-end trade on Sepolia.** *(Architectural spine; Phase 2 layered on the Telegram + Mini App user surface.)*
 
 https://github.com/user-attachments/assets/1454da20-ed7a-4cea-bfa7-a44a066da926
 
@@ -19,12 +19,12 @@ A user broadcasts an intent over [Gensyn AXL](https://github.com/gensyn-ai/axl);
 
 - **Settlement** — single Solidity contract, two-sided lock + atomic swap, EIP-712 signed deals. Deployed at [`0xE5e7…E219`](https://sepolia.etherscan.io/address/0xE5e766d8fEdd8705d537D0016f1A2bff852fE219) on Sepolia. Source: `packages/contracts/`.
 - **Transport** — Gensyn AXL: encrypted Yggdrasil mesh with a polled local HTTP API. No central broker; no presence; no push.
-- **User Agent** — [Hermes Agent](https://nousresearch.com/) (LLM-driven via 0G Compute) + custom MCP servers + AXL sidecar. Source: `packages/user-agent/`.
+- **User Agent** — [Hermes Agent](https://nousresearch.com/) (LLM-driven; **Claude API** as primary in Phase 2, 0G Compute deferred to Phase 4 pending a broker proxy) + custom MCP servers (`axl-mcp`, `og-mcp`) + AXL sidecar. Source: `packages/user-agent/`.
 - **MM Agent** — deterministic TypeScript daemon, *no LLM in the pricing path*. Source: `packages/mm-agent/`.
-- **Mini App** — Next.js + WalletConnect, runs inside Telegram. The only place a user's wallet ever signs. Source: `packages/miniapp/`.
-- **Identity** — MMs as ENS subnames under `parley.eth` (canonical); users by wallet address.
-- **Reputation** — `TradeRecord` blobs on 0G Storage; scores computed on demand, not stored.
-- **Fallback** — Uniswap Trading API when no peer offer arrives.
+- **Mini App** — Next.js + WalletConnect + injected (MetaMask/Rabby/Coinbase), runs inside Telegram or any browser. The only place a user's wallet ever signs. Source: `packages/miniapp/`.
+- **Identity** — MMs as ENS subnames under `parley.eth` on Sepolia ([`mm-1.parley.eth`](https://sepolia.app.ens.domains/mm-1.parley.eth) is live with `addr` + `axl_pubkey` + `agent_capabilities` text records); users by wallet address.
+- **Reputation** — `TradeRecord` blobs on 0G Storage; scores computed on demand, not stored. *(Phase 4.)*
+- **Fallback** — Uniswap Trading API when no peer offer arrives. *(Phase 5.)*
 
 A trade end-to-end:
 
@@ -63,45 +63,53 @@ See [`SPEC.md`](SPEC.md) for the full protocol design.
 |---|---|---|
 | 0 | Every external dep reachable, credentials in place | ✅ done |
 | 1 | One trade settles end-to-end on Sepolia (terminal-only demo) | ✅ done |
-| 2 | Telegram bot + Mini App + Hermes runtime | 🚧 next |
-| 3 | ENS identity layer (real on-chain MM resolution) | pending |
-| 4 | Reputation, refunds, observability | pending |
+| 2 | Telegram bot + Mini App + Hermes runtime + per-action signatures | ✅ done |
+| 3 | ENS identity layer — `mm-1.parley.eth` live on Sepolia | ✅ done |
+| 4 | Reputation, refunds, observability | 🚧 next |
 | 5 | Uniswap fallback + polish | pending |
 
-## Run the Phase 1 demo
+## Running it
 
-Three local processes; full instructions and prerequisites in [`ROADMAP.md`](ROADMAP.md). Quick version:
+The full Phase 2/3 stack is five local processes. **Prereqs:** Node 24+, pnpm 10+, Foundry, Go 1.25+ (for the AXL binary), [Hermes Agent](https://hermes-agent.nousresearch.com/) installed system-wide, Sepolia-funded wallets for the user persona, MM operator, and `parley.eth` parent, `.env` populated from [`.env.example`](.env.example), an HTTPS tunnel for the Mini App (cloudflared/ngrok), and a Telegram bot token. Full operator instructions in [`docs/deployment.md`](docs/deployment.md) and [`ROADMAP.md`](ROADMAP.md).
 
 ```bash
-# 1. AXL nodes (hub for User Agent on :9002, spoke for MM Agent on :9012)
+# 1. AXL nodes (hub for User Agent :9002, spoke for MM Agent :9012)
 ~/GitHub/axl/node -config /tmp/axl-test/hub/node-config.json   &
 ~/GitHub/axl/node -config /tmp/axl-test/spoke/node-config.json &
 
 # 2. MM Agent (long-running)
-cd packages/mm-agent
 AXL_HTTP_URL=http://127.0.0.1:9012 \
-  node --env-file=../../.env --import=tsx src/index.ts
+  node --env-file=.env --import=tsx packages/mm-agent/src/index.ts
 
-# 3. User trade script (one-shot)
-USER_AXL_HTTP_URL=http://127.0.0.1:9002 \
-  pnpm -F @parley/user-agent phase1:trade
+# 3. AXL listener sidecar (chain-watcher + /recv polling logs)
+pnpm -F @parley/user-agent dev
+
+# 4. Mini App + tunnel (Telegram requires HTTPS)
+pnpm -F @parley/miniapp dev
+cloudflared tunnel --url http://localhost:3000   # → paste URL into MINIAPP_BASE_URL
+
+# 5. Hermes gateway (Telegram bot)
+hermes gateway start
 ```
 
-Prereqs: Node 24+, pnpm 10+, Foundry, Go 1.25+ (for the AXL binary), Sepolia-funded wallets for the user persona and the MM operator, `.env` populated from [`.env.example`](.env.example).
+Then send the bot "swap 50 mUSDC for mWETH" and walk through `/connect` → `/authorize-intent` → `/sign` → `/settle` in the Mini App.
+
+**One-shot scripts** (also useful as health checks): see `pnpm -F @parley/user-agent` for `phase0:zg-compute`, `phase0:zg-storage`, `phase3:register-mm`. The Phase 1 terminal-only demo script (`phase1-trade.ts`) was removed when Phase 2 took over user-side signing.
 
 ## Repository layout
 
 ```
 packages/
-├── contracts/      # Foundry — Settlement.sol + tests + deploy scripts
-├── shared/         # TS types shared across agents (Intent, Offer, Deal, TradeRecord)
-├── user-agent/     # Hermes config, custom MCPs, AXL sidecar, Phase-1 trade script
+├── contracts/      # Foundry — Settlement.sol + tests + deploy scripts (incl. TestERC20)
+├── shared/         # TS types + EIP-712 schemas shared across agents
+├── user-agent/     # Hermes config (SOUL.md, skills) + axl-mcp + og-mcp + AXL sidecar
 ├── mm-agent/       # MM daemon (TypeScript, no LLM)
-└── miniapp/        # Next.js + wagmi Mini App
-docs/               # deployment notes
-SPEC.md             # protocol design (source of truth)
-ROADMAP.md          # phase-by-phase build plan
-CLAUDE.md           # project-specific guidance for AI assistants
+└── miniapp/        # Next.js + wagmi Mini App (Telegram + browser)
+artifacts/          # Logo pack (SVG sources, PNG/ICO/manifest derivatives)
+docs/               # Deployment notes
+SPEC.md             # Protocol design (source of truth)
+ROADMAP.md          # Phase-by-phase build plan
+CLAUDE.md           # Project-specific guidance for AI assistants
 ```
 
 ## License

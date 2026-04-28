@@ -37,6 +37,12 @@ export interface Offer {
   id: string;
   intent_id: string;
   mm_agent_id: Hex;
+  /** MM's ENS subname (e.g. mm-1.parley.eth). Lets the User Agent display
+   *  a meaningful identity in the offer card without doing reverse ENS
+   *  resolution. The user's verifier should re-resolve this name and
+   *  confirm `addr` matches `mm_agent_id` and `axl_pubkey` matches the AXL
+   *  prefix-padded form of the sender's pubkey (SPEC §4.4 verification). */
+  mm_ens_name: string;
   price: string; // base/quote, decimal string
   amount: string; // What the MM commits to fill
   expiry: number; // Unix seconds

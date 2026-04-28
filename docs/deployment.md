@@ -36,29 +36,34 @@ Every variable in `.env.example` mapped to consumers. Empty cell = not needed.
 
 | Variable | user-agent | mm-agent | miniapp | Notes |
 |---|:---:|:---:|:---:|---|
-| `SEPOLIA_RPC_URL` | ✓ | ✓ | ✓ | **Paid provider only** (Alchemy/Infura/QuickNode). Public RPCs flake under load — flagged in roadmap risk register. |
-| `SETTLEMENT_CONTRACT_ADDRESS` | ✓ | ✓ |  | Set after one-time Phase 1 deploy. |
-| `AXL_HTTP_URL` | ✓ | ✓ |  | `http://localhost:9002` from inside the agent's container; pin via container DNS if separated. |
+| `SEPOLIA_RPC_URL` | ✓ | ✓ | ✓ | **Paid provider only** (Alchemy/Infura/QuickNode). Public RPCs flake under load — flagged in roadmap risk register; specifically `eth_newFilter` handles get dropped between polls (see `sepolia_rpc_filter_quirk` memory). |
+| `SETTLEMENT_CONTRACT_ADDRESS` | ✓ | ✓ |  | Set after one-time Phase 1 deploy. Currently `0xE5e766d8fEdd8705d537D0016f1A2bff852fE219`. |
+| `USER_AXL_HTTP_URL` | ✓ |  |  | User Agent's local AXL HTTP API. Default `http://localhost:9002`. |
+| `AXL_HTTP_URL` |  | ✓ |  | MM Agent's local AXL HTTP API. Default `http://localhost:9012`. Each agent has its own AXL node — same vars name was reused historically; pin per-process via env. |
 | `AXL_PRIVATE_KEY_PATH` | ✓ | ✓ |  | **File path, not env value.** See §3. |
-| `KNOWN_MM_ENS_NAMES` | ✓ |  |  | Comma-separated MM ENS names the User Agent fans out to. |
-| `PARLEY_ROOT_PRIVATE_KEY` | — | — | — | **One-time scripts only** (`register-mm.ts`). Never in any runtime container. |
-| `TELEGRAM_BOT_TOKEN` | ✓ |  |  |  |
+| `KNOWN_MM_ENS_NAMES` | ✓ |  |  | Comma-separated MM ENS names the User Agent fans out to (resolved via on-chain ENS in Phase 3). |
+| ~~`KNOWN_MM_AXL_PUBKEYS`~~ | — | — | — | **Phase 3: deprecated.** AXL pubkeys are derived from ENS `axl_pubkey` text records now. Still in `.env.example` for reference; safe to remove. |
+| `PARLEY_ROOT_PRIVATE_KEY` | — | — | — | **One-time scripts only** (`register-mm.ts` for ENS subnames). Never in any runtime container. Currently owns `parley.eth` AND `mm-1.parley.eth` on Sepolia (Phase 4 transfers subname ownership to MM_EVM — see §6). |
+| `TELEGRAM_BOT_TOKEN` | ✓ |  |  | Hermes' Telegram gateway uses this; same bot must be allowlisted via @BotFather pairing flow (see §8 Hermes pairing note). |
+| `ANTHROPIC_API_KEY` | ✓ |  |  | **Phase 2 primary LLM.** Hermes points at Claude API directly. Required. |
 | `ZG_COMPUTE_ENDPOINT` | (✓) |  |  | **Phase 2 decision: deferred.** Used only after the 0G Compute proxy ships in Phase 4 (per `zg_compute_findings` memory: per-request signed headers, no static API key). Optional until then. |
 | `ZG_COMPUTE_KEY` | (✓) |  |  | Same — unused by Hermes directly. |
 | `ZG_COMPUTE_PROVIDER` | (✓) |  |  | Same. |
-| `ANTHROPIC_API_KEY` | ✓ |  |  | **Phase 2 primary LLM.** Hermes points at Claude API directly. Required. |
-| `ZG_STORAGE_RPC_URL` | ✓ | ✓ |  | Reads (User Agent reputation lookups) + writes (both: trade records). |
-| `ZG_STORAGE_INDEXER_URL` | ✓ | ✓ |  |  |
+| `ZG_STORAGE_RPC_URL` | ✓ | ✓ |  | Reads (User Agent reputation lookups) + writes (both: trade records). Phase 4. |
+| `ZG_STORAGE_INDEXER_URL` | ✓ | ✓ |  | Same. |
 | `OG_PRIVATE_KEY` | ✓ | ✓ |  | Pays storage uploads (and Compute, for the User Agent). Each agent should have **its own** key in production — don't share one wallet across the User Agent and MM Agent. |
-| `MM_EVM_PRIVATE_KEY` |  | ✓ |  | Sepolia hot wallet. Funded with Sepolia ETH for gas + tokenB inventory. |
+| `MM_EVM_PRIVATE_KEY` |  | ✓ |  | Sepolia hot wallet. Funded with Sepolia ETH for gas + tokenB inventory. The `addr` text record on `mm-1.parley.eth` resolves to this wallet's address. |
 | `MM_ENS_NAME` |  | ✓ |  | e.g. `mm-1.parley.eth`. Matches what the User Agent has in `KNOWN_MM_ENS_NAMES`. |
 | `MM_SPREAD_BPS` |  | ✓ |  |  |
-| `MM_INVENTORY_USDC`, `MM_INVENTORY_WETH` |  | ✓ |  |  |
+| `MM_INVENTORY_USDC`, `MM_INVENTORY_WETH` |  | ✓ |  | Inventory caps; the MM self-mints + approves at boot against TestERC20s. |
+| `MM_OFFER_EXPIRY_MS`, `MM_SETTLEMENT_WINDOW_MS` |  | ✓ |  | Default 120000 / 300000. |
+| `SEPOLIA_USDC_ADDRESS`, `SEPOLIA_WETH_ADDRESS` | ✓ | ✓ |  | TestERC20 addresses (Phase 1 deployments). Swap to canonical Sepolia USDC/WETH if running with non-test users. |
+| `MINIAPP_BASE_URL` | ✓ |  |  | HTTPS URL the bot embeds in `web_app` buttons. Stable hostname required (Telegram refuses non-HTTPS; cached after the first BotFather config). |
 | `NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID` |  |  | ✓ | **Baked at `next build`.** See §4. |
 | `NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS` |  |  | ✓ | Same. |
 | `NEXT_PUBLIC_CHAIN_ID` |  |  | ✓ | `11155111`. Baked. |
-| `MINIAPP_JWT_SIGNING_KEY` |  |  | ✓ | Server-only (signs JWTs the bot embeds in Mini App URLs). |
-| `UNISWAP_API_URL`, `UNISWAP_API_KEY` | ✓ |  |  | User Agent only — fallback path + reference price. |
+| `MINIAPP_JWT_SIGNING_KEY` |  |  | ✓ | Server-only (signs JWTs the bot will embed in Mini App URLs in Phase 4 — currently unused, URLs are unsigned). |
+| `UNISWAP_API_URL`, `UNISWAP_API_KEY` | ✓ |  |  | User Agent only — fallback path + reference price. Phase 5. |
 
 **Single `.env` strategy.** We're keeping one root-level `.env` as the source of truth (already wired into `next.config.mjs` via `process.loadEnvFile`). Build/deploy pipeline must:
 
@@ -76,7 +81,8 @@ Things that **must survive container restarts** and therefore need named volumes
 |---|---|---|---|
 | `axl.pem` (User Agent) | user-agent host | ed25519 PEM | Identity on AXL mesh. New PEM = new pubkey = User Agent looks like a stranger to MMs. |
 | `axl.pem` (MM Agent) | mm-agent host | ed25519 PEM | Same; **also published as `text("axl_pubkey")` ENS record on `mm-N.parley.eth`.** Re-keying = stale ENS, MMs unreachable until re-registered. |
-| Hermes session memory | user-agent host | TBD (Phase 2) | Per-Telegram-user state (`session_sig`, wallet binding, in-flight intents). Spec says in-process; need to confirm Hermes' persistence story before assuming we can recycle the container without losing live sessions. |
+| `~/.hermes/` | user-agent host | Hermes' state dir | Holds DM pairing data (`pairing/`), session memory, MCP config, model config, conversation history. Mount as a named volume; losing it forces every Telegram user to re-pair (per `hermes_pairing_flow` memory) and drops all in-flight session bindings. |
+| `~/.hermes/SOUL.md` + `~/.hermes/skills/` | user-agent host | Procedural memory | Synced from `packages/user-agent/hermes-config/` at deploy time (see §4). The repo is the source of truth — symlink or copy at install. |
 | Foundry deploy artifacts | dev machine | tx hash, contract address | Not container state — committed/recorded at deploy. Source for `SETTLEMENT_CONTRACT_ADDRESS`. |
 
 **Things that look like state but aren't:**
@@ -91,23 +97,41 @@ Things that **must survive container restarts** and therefore need named volumes
 
 ```
 Step 1 (one-time):
-  - forge build && forge script Deploy.s.sol → SETTLEMENT_CONTRACT_ADDRESS recorded into .env
-  - register-mm.ts → MM ENS subnames published with text records
+  - forge build && forge script Deploy.s.sol  → SETTLEMENT_CONTRACT_ADDRESS into .env
+  - forge script DeployTestTokens.s.sol       → SEPOLIA_USDC/WETH_ADDRESS into .env
+                                                (skip if using canonical Sepolia tokens)
+  - pnpm -F @parley/user-agent phase3:register-mm
+                                              → mm-N.parley.eth on Sepolia ENS with
+                                                addr / axl_pubkey / agent_capabilities
+                                                text records
 
 Step 2 (per release):
   - pnpm install --frozen-lockfile
-  - pnpm -F @parley/shared build          # types other packages depend on
-  - pnpm -F @parley/user-agent build      # tsc → dist/
-  - pnpm -F @parley/mm-agent build        # tsc → dist/
-  - pnpm -F @parley/miniapp build         # next build — reads NEXT_PUBLIC_* from .env
-  - cd ~/GitHub/axl && make build         # produces ./node binary; copy into images
+  - pnpm -F @parley/shared        build        # types other packages depend on
+  - pnpm -F @parley/og-mcp        build        # tsc → dist/
+  - pnpm -F @parley/axl-mcp       build        # tsc → dist/
+  - pnpm -F @parley/user-agent    build        # tsc → dist/ (sidecar)
+  - pnpm -F @parley/mm-agent      build        # tsc → dist/
+  - pnpm -F @parley/miniapp       sync-assets  # mirrors artifacts/ into miniapp/public/
+  - pnpm -F @parley/miniapp       build        # next build — reads NEXT_PUBLIC_* from .env
+  - cd ~/GitHub/axl && make build              # produces ./node binary; copy into images
 
 Step 3 (image build):
   - User Agent image: Python 3.11+ base (for Hermes) + Node 24 (for MCPs) + Go binary
-                      + MCP dist/ + hermes-config/ → mounted into Hermes' ~/.hermes/
-  - MM Agent image:   Node 24 base + Go binary + dist/
-  - Mini App image:   Node 24 base + .next/ + public/
+                      + og-mcp dist/ + axl-mcp dist/ + axl-sidecar dist/
+                      + hermes-config/ (SOUL.md + skills/) mounted into ~/.hermes/
+  - MM Agent image:   Node 24 base + Go binary + mm-agent dist/
+  - Mini App image:   Node 24 base + .next/ + public/ (logo + favicons + OG cards
+                      from sync-assets)
 ```
+
+**`sync-assets` step is required before `next build`.** The Mini App's `public/favicon/`, `public/social/`, and root-level `lockup-horizontal.svg` / `mark.svg` are mirrored from `/artifacts/` (which is the source of truth — see CLAUDE.md "Logos and assets"). If you regenerate `artifacts/build.py` outputs and skip `sync-assets`, the deployed Mini App ships stale logos and the manifest's icon paths can 404.
+
+**Hermes config sync at install time.** The repo holds canonical SOUL.md + skills under `packages/user-agent/hermes-config/`. Hermes reads its system prompt and skills from `~/.hermes/`. Pick one of:
+- **Symlink** at install: `ln -sf $(pwd)/packages/user-agent/hermes-config/SOUL.md ~/.hermes/SOUL.md` and same for `skills/`.
+- **Copy + watch** if symlinks are awkward in the deployment env (Docker volumes that can't symlink across mount boundaries, etc.).
+
+In dev, the symlink keeps Hermes in sync with edits without restart.
 
 **Hermes packaging note:** Hermes installs system-wide via the upstream `install.sh` (Python project, not vendored as a submodule). For the User Agent container we either (a) bake the install into the image's Dockerfile via `RUN curl | bash`, or (b) use the upstream's `docker-compose.yml` and mount our config + MCP binaries as volumes. Decide in Phase 5 once Hermes' deployment surface is exercised.
 
@@ -144,10 +168,11 @@ Server-only env (`MINIAPP_JWT_SIGNING_KEY`, anything not prefixed `NEXT_PUBLIC_`
 Things outside the repo that need to match production deployment values. Easy to forget; expensive when wrong.
 
 - **WalletConnect Cloud (cloud.reown.com):** add the Mini App's production hostname to the project's allowed domains. Required for the WC modal to load wallets in production.
-- **Telegram BotFather:** `/setdomain` (Login Widget) and the `web_app` URL on the bot's menu button must point to the production Mini App URL. The bot token in the env must match the same bot.
-- **ENS subnames (Sepolia):** `mm-N.parley.eth` text records (`addr`, `axl_pubkey`, `agent_capabilities`, `reputation_root`) must match the **production** AXL pubkey and EVM addr. Re-running registration after a key rotation is mandatory.
-- **Sepolia funding:** MM Agent's hot wallet must hold both Sepolia ETH (gas) and inventory tokens (`tokenB`). User personas trading need Sepolia USDC / WETH approvals to the Settlement contract.
-- **0G ledger:** funded with at least 1 OG locked balance per acknowledged provider, plus headroom (we hit the floor in Phase 0 testing — see `zg_compute_findings`).
+- **Telegram BotFather:** `/setdomain` (Login Widget) and the `web_app` URL on the bot's menu button must point to the production Mini App URL. The bot token in the env must match the same bot. **Bot avatar:** upload `artifacts/png/avatar-dark-512.png`.
+- **ENS subnames (Sepolia):** `mm-N.parley.eth` are registered via `pnpm phase3:register-mm`. Currently set on `mm-1.parley.eth`: `addr` → `MM_EVM` derived address, `axl_pubkey` → `KNOWN_MM_AXL_PUBKEYS[0]`, `agent_capabilities` → JSON. **`reputation_root` is not set** — Phase 4 sets it after the first trade. **Subname owner is `PARLEY_ROOT`**, not `MM_EVM` — Phase 4 needs to either transfer ownership to the MM (so the MM can update `reputation_root` on its own) or set up resolver-level approval (`Resolver.approve(mm, true)` so the MM can call `setText` without owning the subname). Re-running registration after a key rotation is mandatory.
+- **GitHub repo settings:** social preview image → `artifacts/png/app-icon-light-256.png` (or `-dark-256.png`).
+- **Sepolia funding:** the MM Agent's hot wallet (`MM_EVM`) holds Sepolia ETH for gas; mUSDC/mWETH are self-minted at boot via the TestERC20s' public `mint()`. User personas trading need their wallet pre-approved to the Settlement contract for the input token (Phase 4 polish: Mini App detects + prompts).
+- **0G ledger:** funded with at least 1 OG locked balance per acknowledged provider, plus headroom (we hit the floor in Phase 0 testing — see `zg_compute_findings`). Phase 4 only.
 
 ---
 
@@ -186,6 +211,8 @@ Add explicit `depends_on` + healthchecks — agents should fail fast if their AX
 - **Backups.** The two `axl.pem` files and the deployer wallet PKs are the only true non-recreatable state. Cold backup somewhere outside the host.
 - **Rotation.** Plan for rotating `MM_EVM_PRIVATE_KEY` (drain, redeploy with new key, update ENS `addr` record, restart). Plan for rotating `axl.pem` (new key, re-register `axl_pubkey` text record, restart).
 - **Telegram rate limits.** Mitigation per spec: edit messages instead of sending new ones for live status updates. If 429s appear, basic backoff.
+- **Sepolia chain-watcher RPC choice.** The AXL sidecar uses `getContractEvents` polling rather than `viem.watchContractEvent` because public Sepolia RPCs (publicnode.com tested) drop `eth_newFilter` handles between polls (`sepolia_rpc_filter_quirk` memory). Once on a paid RPC that persists filters, the sidecar should switch back to `watchContractEvent` for lower latency.
+- **Logo asset sync.** When updating logos, edit `artifacts/svg/`, regenerate via `artifacts/build.py`, then run `pnpm -F @parley/miniapp sync-assets` and rebuild. Skipping `sync-assets` ships stale icons (CLAUDE.md "Logos and assets" has the full convention).
 - **Hermes DM pairing for production.** During Phase 2 dev we set `unauthorized_dm_behavior: ignore` to silence pairing prompts on a single-user dev box. **Production deploy must reverse this** — either re-enable pairing (default) and approve users via `hermes pairing approve telegram <CODE>`, or curate `TELEGRAM_ALLOWED_USERS` in `~/.hermes/.env` with the explicit Telegram user IDs allowed to talk to the bot. Without one of those, anyone who finds the bot's username gets nothing (silent black hole) — fine for staging, but degrades the demo onboarding experience. See `hermes_pairing_flow` memory for the full flow.
 - **Multi-user isolation verification.** Phase 2 baseline (ROADMAP §1 outcome 1) requires confirming Hermes' per-Telegram-user state isolation works under load — two test accounts, simultaneous sessions, no context leakage. Deferred during dev; **must be checked before declaring Phase 2 closed for any external tester**.
 
@@ -195,9 +222,9 @@ Add explicit `depends_on` + healthchecks — agents should fail fast if their AX
 
 Open questions to resolve as Phase 2-5 lands. Each becomes a section here when answered.
 
-- **Hermes persistence model.** Does session memory survive process restarts? Hermes' state lives at `~/.hermes/` — we'll know during Phase 2 baseline whether per-user state is durable across restarts. If not, that drives the volume layout.
-- **Hermes config layout.** Phase 2 baseline produces `~/.hermes/config.toml` (or equivalent) interactively via `hermes setup`. Need to decide whether to (a) check the resulting config into the repo as-is and mount it, or (b) re-run `hermes setup` per-environment. Likely (a) for reproducibility but (b) for secrets hygiene — split the config from the secrets.
+- **MM subname ownership transfer (Phase 4).** Currently `parley.eth` and all its subnames are owned by `PARLEY_ROOT`. The MM needs to update its own `text("reputation_root")` after each settled trade — that requires either (a) `setSubnodeOwner(parentNode, label, MM_EVM)` to transfer ownership, or (b) resolver-level `approve(node, MM_EVM, true)` so the MM can call `setText` without owning the subname. Decide before Phase 4's reputation-write path lands.
+- **Hermes config split (config vs secrets).** `~/.hermes/config.{yaml,toml}` is generated by `hermes setup` and contains a mix of model selection (reproducible) and API keys (secret). For container deploys, decide whether to (a) check config into the repo and mount over secrets, (b) re-run `hermes setup --non-interactive` per-environment, or (c) generate config from a template at boot. Production-grade ops question; staging can keep the dev config.
 - **Single-machine vs split deployment.** Demo cost of running everything on one VPS vs. cleanly separating User Agent and MM Agent infra. (One-VPS is fine for the demo.)
-- **Mini App secret handling for `MINIAPP_JWT_SIGNING_KEY`.** Random per-deploy or stable? Stable means JWTs survive deploys — preferable for in-flight sessions.
+- **Mini App secret handling for `MINIAPP_JWT_SIGNING_KEY`.** Random per-deploy or stable? Stable means JWTs survive deploys — preferable for in-flight sessions. (Currently unused; Phase 4 polish.)
 - **AXL node listen vs NAT.** Demo can run all nodes NAT'd behind the existing public Gensyn nodes. Production should run at least one Parley-operated public AXL peer for resilience.
 - **CI/CD pipeline.** Push-to-deploy? Manual? Out of scope here until we know the host.
