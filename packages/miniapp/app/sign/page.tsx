@@ -15,7 +15,7 @@
 
 "use client";
 
-import { Suspense, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import {
   useAccount,
   useConnect,
@@ -43,7 +43,23 @@ const SETTLEMENT_ABI = parseAbi([
   "function lockUserSide((address user,address mm,address tokenA,address tokenB,uint256 amountA,uint256 amountB,uint256 deadline,uint256 nonce) deal, bytes userSig)",
 ]);
 
-type Step = "idle" | "signing" | "submitting" | "confirming" | "done";
+const ERC20_ABI = parseAbi([
+  "function allowance(address owner, address spender) view returns (uint256)",
+  "function approve(address spender, uint256 amount) returns (bool)",
+  "function symbol() view returns (string)",
+]);
+
+const MAX_UINT256 = 2n ** 256n - 1n;
+
+type Step =
+  | "idle"
+  | "checking_allowance"
+  | "needs_approval"
+  | "approving"
+  | "signing"
+  | "submitting"
+  | "confirming"
+  | "done";
 
 function SignInner() {
   const params = useSearchParams();
@@ -62,6 +78,35 @@ function SignInner() {
   const [step, setStep] = useState<Step>("idle");
   const [error, setError] = useState<string | null>(null);
   const [txHash, setTxHash] = useState<Hex | null>(null);
+  const [allowance, setAllowance] = useState<bigint | null>(null);
+
+  // Re-check allowance whenever connection / deal changes.
+  useEffect(() => {
+    if (!isConnected || !address || !publicClient || !dealJson) return;
+    let cancelled = false;
+    (async () => {
+      setStep("checking_allowance");
+      try {
+        const parsed = JSON.parse(dealJson) as DealTerms;
+        const a = (await publicClient.readContract({
+          address: parsed.tokenA,
+          abi: ERC20_ABI,
+          functionName: "allowance",
+          args: [address, SETTLEMENT_ADDRESS],
+        })) as bigint;
+        if (cancelled) return;
+        setAllowance(a);
+        setStep(a < BigInt(parsed.amountA) ? "needs_approval" : "idle");
+      } catch (err) {
+        if (cancelled) return;
+        setError((err as Error).message);
+        setStep("idle");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isConnected, address, publicClient, dealJson]);
 
   const deal = useMemo<DealTerms | null>(() => {
     if (!dealJson) return null;
@@ -113,6 +158,29 @@ function SignInner() {
         </ErrLine>
       </Page>
     );
+  }
+
+  async function approve() {
+    if (!deal || !publicClient) return;
+    setError(null);
+    try {
+      if (chainId !== SEPOLIA_CHAIN_ID) {
+        await switchChainAsync({ chainId: SEPOLIA_CHAIN_ID });
+      }
+      setStep("approving");
+      const tx = await writeContractAsync({
+        address: deal.tokenA,
+        abi: ERC20_ABI,
+        functionName: "approve",
+        args: [SETTLEMENT_ADDRESS, MAX_UINT256],
+      });
+      await publicClient.waitForTransactionReceipt({ hash: tx, confirmations: 1 });
+      setAllowance(MAX_UINT256);
+      setStep("idle");
+    } catch (err) {
+      setError((err as Error).message);
+      setStep("needs_approval");
+    }
   }
 
   async function signAndSubmit() {
@@ -227,17 +295,36 @@ function SignInner() {
         Your wallet will show the full deal in the EIP-712 prompt. Verify the
         amounts there before approving.
       </p>
-      <button onClick={signAndSubmit} disabled={step !== "idle"} style={btn}>
-        {step === "signing"
-          ? "Signing…"
-          : step === "submitting"
-            ? "Submitting tx…"
-            : step === "confirming"
-              ? "Waiting for confirmation…"
-              : step === "done"
-                ? "Done ✓"
-                : "Sign + lock"}
-      </button>
+      {step === "checking_allowance" && (
+        <p style={{ fontSize: 13, opacity: 0.7 }}>Checking token allowance…</p>
+      )}
+      {step === "needs_approval" || step === "approving" ? (
+        <>
+          <p style={{ fontSize: 13, opacity: 0.7 }}>
+            Settlement isn't yet approved to spend your token. One-time on-chain
+            approval is required before you can lock.
+          </p>
+          <button onClick={approve} disabled={step === "approving"} style={btn}>
+            {step === "approving" ? "Approving…" : "Approve token"}
+          </button>
+        </>
+      ) : (
+        <button
+          onClick={signAndSubmit}
+          disabled={step !== "idle"}
+          style={btn}
+        >
+          {step === "signing"
+            ? "Signing…"
+            : step === "submitting"
+              ? "Submitting tx…"
+              : step === "confirming"
+                ? "Waiting for confirmation…"
+                : step === "done"
+                  ? "Done ✓"
+                  : "Sign + lock"}
+        </button>
+      )}
       {txHash && (
         <p style={{ marginTop: 12, fontSize: 13 }}>
           tx:{" "}

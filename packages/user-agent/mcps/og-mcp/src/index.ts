@@ -31,7 +31,7 @@ import {
   tallyMMStats,
   tallyUserStats,
 } from "./reputation.js";
-import { fetchTradeRecord, uploadTradeRecord } from "./storage.js";
+import { fetchMmIndexBlob, fetchTradeRecord, uploadTradeRecord } from "./storage.js";
 
 const SEPOLIA_RPC_URL = process.env["SEPOLIA_RPC_URL"];
 if (!SEPOLIA_RPC_URL) {
@@ -146,11 +146,43 @@ server.registerTool(
   "read_mm_reputation",
   {
     description:
-      "Return a Parley MM's aggregate reputation score in [-0.5, 1.0] alongside trade-count, keyed by ENS name. Implements SPEC §7.3 scoring (SMOOTHING=5, MM_TIMEOUT_WEIGHT=0.5) over TradeRecord blobs read from 0G Storage. Fresh accounts (zero records) get neutral 0.0.",
+      "Return a Parley MM's aggregate reputation score in [-0.5, 1.0] alongside trade-count, keyed by ENS name. Reads via the canonical ENS path (SPEC §4.4): resolves ens_name → text('reputation_root') → fetches index blob from 0G Storage → fetches each TradeRecord. Falls back to og-mcp's local index if the ENS pointer is unset. Implements SPEC §7.3 scoring (SMOOTHING=5, MM_TIMEOUT_WEIGHT=0.5).",
     inputSchema: { ens_name: z.string() },
   },
   async ({ ens_name }) => {
-    const rootHashes = listMMRecords(ens_name);
+    let rootHashes: string[] = [];
+    let source: "ens" | "local" | "none" = "none";
+
+    // Canonical path: ENS reputation_root → index blob → records.
+    let name: string;
+    try {
+      name = normalize(ens_name);
+    } catch {
+      name = ens_name;
+    }
+    try {
+      const reputationRoot = await client.getEnsText({ name, key: "reputation_root" });
+      if (reputationRoot && reputationRoot.startsWith("0x")) {
+        const blob = await fetchMmIndexBlob(reputationRoot);
+        rootHashes = blob.records;
+        source = "ens";
+      }
+    } catch (err) {
+      process.stderr.write(
+        `[og-mcp] reputation_root fetch failed for ${ens_name}: ${(err as Error).message}\n`,
+      );
+    }
+
+    // Fallback: local index (mostly empty for MMs the og-mcp host doesn't
+    // know about, but useful for the User Agent's own past trades).
+    if (rootHashes.length === 0) {
+      const local = listMMRecords(ens_name);
+      if (local.length > 0) {
+        rootHashes = local;
+        source = "local";
+      }
+    }
+
     const records = await fetchAllSafely(rootHashes);
     const stats = tallyMMStats(records);
     const score = computeMMScore(stats);
@@ -161,6 +193,7 @@ server.registerTool(
           text: JSON.stringify(
             {
               ens_name,
+              source,
               score,
               n_trades: records.length,
               n_settled: stats.settlements,

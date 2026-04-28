@@ -81,9 +81,26 @@ export async function uploadTradeRecord(record: TradeRecord): Promise<string> {
 
 /** Download a TradeRecord by its root hash, verify Merkle proof. */
 export async function fetchTradeRecord(rootHash: string): Promise<TradeRecord> {
+  return fetchJsonBlob<TradeRecord>(rootHash);
+}
+
+/** Download an MM index blob ({ records: rootHash[] }) by root hash. The
+ *  reputation_root ENS text record points at one of these. */
+export interface MmIndexBlob {
+  records: string[];
+}
+export async function fetchMmIndexBlob(rootHash: string): Promise<MmIndexBlob> {
+  const j = await fetchJsonBlob<unknown>(rootHash);
+  if (j && typeof j === "object" && Array.isArray((j as MmIndexBlob).records)) {
+    return j as MmIndexBlob;
+  }
+  throw new Error(`index blob ${rootHash} has no "records" array`);
+}
+
+async function fetchJsonBlob<T>(rootHash: string): Promise<T> {
   const indexer = getIndexer();
   const dir = mkdtempSync(join(tmpdir(), "parley-og-dl-"));
-  const path = join(dir, "record.json");
+  const path = join(dir, "blob");
   try {
     const err = await indexer.download(rootHash, path, true);
     if (err !== null) {
@@ -91,8 +108,7 @@ export async function fetchTradeRecord(rootHash: string): Promise<TradeRecord> {
     }
     const bytes = readFileSync(path);
     const text = new TextDecoder().decode(bytes);
-    const record = JSON.parse(text) as TradeRecord;
-    return record;
+    return JSON.parse(text) as T;
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

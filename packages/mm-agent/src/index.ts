@@ -19,6 +19,7 @@ import type {
   Offer,
   ParleyMessage,
   TokenRef,
+  TradeRecord,
 } from "@parley/shared";
 
 import { AxlClient } from "./axl-client.js";
@@ -31,6 +32,7 @@ import {
   type NegotiatorConfig,
   type PreparedOffer,
 } from "./negotiator.js";
+import { ReputationPublisher } from "./reputation-publisher.js";
 import { buildWallet, type MmWallet } from "./wallet.js";
 
 const POLL_INTERVAL_MS = 2_000;
@@ -100,7 +102,14 @@ function readEnv(): Env {
   };
 }
 
-type PendingState = "awaiting_accept" | "awaiting_user_lock" | "submitted";
+// Phase 4 state machine — keeps entries in `pending` past lockMMSide so we
+// can write a TradeRecord at the terminal transition (settled / refunded /
+// timeout). Without that, reputation never accrues.
+type PendingState =
+  | "awaiting_accept"
+  | "awaiting_user_lock"
+  | "mm_submitted"
+  | "recorded";
 
 interface PendingDeal {
   offer: Offer;
@@ -109,6 +118,15 @@ interface PendingDeal {
   outflow: PreparedOffer["outflow"];
   counterpartyPeerId: string;
   mmSig: Hex;
+  /** From the user's Accept envelope — the EIP-712 sig over the Deal that
+   *  the user submitted via lockUserSide. Stored so we can include it in
+   *  the TradeRecord (SPEC §7.1 `user_signature`). */
+  userSig: Hex | null;
+  /** Unix seconds when we first observed the on-chain state advance to
+   *  USER_LOCKED / BOTH_LOCKED. Approximate; exact block timestamps would
+   *  require a getBlock call we skip in Phase 4 to keep the sweep cheap. */
+  user_locked_at: number | null;
+  mm_locked_at: number | null;
   state: PendingState;
 }
 
@@ -117,6 +135,11 @@ async function main(): Promise<void> {
   const account = privateKeyToAccount(env.privateKey);
   const wallet = buildWallet(env.privateKey, env.rpcUrl);
   const axl = new AxlClient(env.axlHttpUrl);
+  const reputation = new ReputationPublisher({
+    mmEnsName: env.ensName,
+    rpcUrl: env.rpcUrl,
+    privateKey: env.privateKey,
+  });
 
   const { inventory, limits } = loadInventoryFromEnv({
     usdcDecimals: env.knownTokens.usdc.decimals,
@@ -175,9 +198,9 @@ async function main(): Promise<void> {
       log({ event: "recv_error", err: (err as Error).message });
     }
 
-    // 2. Sweep pending deals: drop expired offers, submit lockMMSide for any
-    //    deal that's now UserLocked on chain.
-    await sweepPending(pending, cfg, wallet);
+    // 2. Sweep pending deals: advance through state transitions, write
+    //    TradeRecords at terminal states, publish reputation_root updates.
+    await sweepPending(pending, cfg, wallet, reputation);
 
     await sleep(POLL_INTERVAL_MS);
   }
@@ -247,6 +270,9 @@ async function handleIntent(
     outflow: prepared.outflow,
     counterpartyPeerId: replyTo,
     mmSig: sig,
+    userSig: null,
+    user_locked_at: null,
+    mm_locked_at: null,
     state: "awaiting_accept",
   });
 
@@ -291,6 +317,12 @@ function handleAccept(
   }
 
   found.state = "awaiting_user_lock";
+  // Spec §5.2: Accept's `signature` is the user's EIP-712 sig over the Deal
+  // (the same sig they pass to lockUserSide). Store for the eventual
+  // TradeRecord; trust here is bounded — if it's wrong, the chain will reject
+  // their lock anyway, and our record's user_signature ends up garbage but
+  // the deal_hash + settled fields stay correct (which is what scoring uses).
+  found.userSig = accept.signature;
   log({
     event: "accept_received",
     offer_id: accept.offer_id,
@@ -298,23 +330,31 @@ function handleAccept(
   });
 }
 
-/** For each pending deal, advance the state machine based on chain state and
- *  the wall clock. Submits `lockMMSide` once the contract reports UserLocked. */
+/** Advance each pending deal's state machine based on chain state and the
+ *  wall clock. Writes a TradeRecord (and publishes reputation_root) at each
+ *  terminal transition. */
 async function sweepPending(
   pending: Map<string, PendingDeal>,
   cfg: NegotiatorConfig,
   wallet: MmWallet,
+  reputation: ReputationPublisher,
 ): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
   for (const [offerId, p] of pending) {
-    // Drop offers nobody accepted before the deadline.
+    // Drop offers nobody accepted before the deadline. Pre-accept = no trade
+    // happened — nothing to record.
     if (p.state === "awaiting_accept" && now >= p.deal.deadline) {
       log({ event: "offer_expired", offer_id: offerId, deal_hash: p.dealHashHex });
       pending.delete(offerId);
       continue;
     }
 
-    if (p.state !== "awaiting_user_lock") continue;
+    if (p.state === "recorded") {
+      pending.delete(offerId);
+      continue;
+    }
+
+    if (p.state !== "awaiting_user_lock" && p.state !== "mm_submitted") continue;
 
     let onchainState: number;
     try {
@@ -335,52 +375,147 @@ async function sweepPending(
       continue;
     }
 
-    if (onchainState === STATE_NONE) {
-      // user hasn't locked yet; check deadline
-      if (now >= p.deal.deadline) {
-        log({ event: "user_never_locked", offer_id: offerId, deal_hash: p.dealHashHex });
-        pending.delete(offerId);
+    // ---- awaiting_user_lock ----------------------------------------------
+    if (p.state === "awaiting_user_lock") {
+      if (onchainState === STATE_NONE) {
+        if (now >= p.deal.deadline) {
+          // User accepted but never locked → §7.3 "failed acceptance".
+          await recordTerminal(p, reputation, {
+            settled: false,
+            defaulted: "user",
+          });
+          p.state = "recorded";
+          pending.delete(offerId);
+        }
+        continue;
       }
-      continue;
-    }
-    if (onchainState === STATE_USER_LOCKED) {
-      try {
-        const txHash = await lockMMSide(p.deal, p.mmSig, cfg, wallet);
-        cfg.inventory[p.outflow.token] -= p.outflow.amount;
-        p.state = "submitted";
-        log({
-          event: "mm_locked",
-          offer_id: offerId,
-          deal_hash: p.dealHashHex,
-          tx: txHash,
-          new_inventory_usdc_wei: cfg.inventory.usdc.toString(),
-          new_inventory_weth_wei: cfg.inventory.weth.toString(),
-        });
-        pending.delete(offerId);
-      } catch (err) {
-        log({
-          event: "lockmm_error",
-          offer_id: offerId,
-          deal_hash: p.dealHashHex,
-          err: (err as Error).message,
-        });
+      if (onchainState === STATE_USER_LOCKED) {
+        if (p.user_locked_at === null) p.user_locked_at = now;
+        try {
+          const txHash = await lockMMSide(p.deal, p.mmSig, cfg, wallet);
+          cfg.inventory[p.outflow.token] -= p.outflow.amount;
+          p.mm_locked_at = Math.floor(Date.now() / 1000);
+          p.state = "mm_submitted";
+          log({
+            event: "mm_locked",
+            offer_id: offerId,
+            deal_hash: p.dealHashHex,
+            tx: txHash,
+            new_inventory_usdc_wei: cfg.inventory.usdc.toString(),
+            new_inventory_weth_wei: cfg.inventory.weth.toString(),
+          });
+        } catch (err) {
+          log({
+            event: "lockmm_error",
+            offer_id: offerId,
+            deal_hash: p.dealHashHex,
+            err: (err as Error).message,
+          });
+        }
+        continue;
       }
-      continue;
+      if (onchainState === STATE_BOTH_LOCKED) {
+        // Someone (the user, or a courtesy retry) submitted lockMMSide for
+        // us — unusual. Treat as if we'd done it ourselves.
+        if (p.user_locked_at === null) p.user_locked_at = now;
+        if (p.mm_locked_at === null) p.mm_locked_at = now;
+        p.state = "mm_submitted";
+        log({ event: "both_locked_observed", offer_id: offerId, deal_hash: p.dealHashHex });
+        continue;
+      }
+      if (onchainState === STATE_SETTLED) {
+        if (p.user_locked_at === null) p.user_locked_at = now;
+        if (p.mm_locked_at === null) p.mm_locked_at = now;
+        await recordTerminal(p, reputation, { settled: true, defaulted: "none" });
+        p.state = "recorded";
+        pending.delete(offerId);
+        continue;
+      }
+      if (onchainState === STATE_REFUNDED) {
+        if (p.user_locked_at === null) p.user_locked_at = now;
+        await recordTerminal(p, reputation, {
+          settled: false,
+          defaulted: p.mm_locked_at === null ? "mm" : "timeout",
+        });
+        p.state = "recorded";
+        pending.delete(offerId);
+        continue;
+      }
     }
-    if (
-      onchainState === STATE_BOTH_LOCKED ||
-      onchainState === STATE_SETTLED ||
-      onchainState === STATE_REFUNDED
-    ) {
-      // Either we already submitted, or someone settled/refunded out from under us.
-      log({
-        event: "deal_terminal",
-        offer_id: offerId,
-        deal_hash: p.dealHashHex,
-        chain_state: onchainState,
-      });
-      pending.delete(offerId);
+
+    // ---- mm_submitted ----------------------------------------------------
+    if (p.state === "mm_submitted") {
+      if (onchainState === STATE_SETTLED) {
+        await recordTerminal(p, reputation, { settled: true, defaulted: "none" });
+        p.state = "recorded";
+        pending.delete(offerId);
+        continue;
+      }
+      if (onchainState === STATE_REFUNDED) {
+        await recordTerminal(p, reputation, { settled: false, defaulted: "timeout" });
+        p.state = "recorded";
+        pending.delete(offerId);
+        continue;
+      }
+      if (onchainState === STATE_BOTH_LOCKED && now >= p.deal.deadline) {
+        // Both locked but settle never landed before deadline. Caller could
+        // refund either side; from our side we're done.
+        await recordTerminal(p, reputation, { settled: false, defaulted: "timeout" });
+        p.state = "recorded";
+        pending.delete(offerId);
+        continue;
+      }
+      // BothLocked && before deadline → keep waiting for settle.
     }
+  }
+}
+
+/** Build a TradeRecord from PendingDeal state, publish via 0G Storage + ENS. */
+async function recordTerminal(
+  p: PendingDeal,
+  reputation: ReputationPublisher,
+  outcome: { settled: boolean; defaulted: TradeRecord["defaulted"] },
+): Promise<void> {
+  const record: TradeRecord = {
+    trade_id: p.dealHashHex,
+    timestamp: Math.floor(Date.now() / 1000),
+    user_agent: p.deal.user,
+    mm_agent: p.deal.mm,
+    pair: "USDC/WETH", // Phase 4: only pair the MM trades.
+    amount_a: p.deal.amountA,
+    amount_b: p.deal.amountB,
+    negotiated_price: p.offer.price,
+    user_locked: p.user_locked_at !== null,
+    user_locked_at: p.user_locked_at ?? 0,
+    mm_locked: p.mm_locked_at !== null,
+    mm_locked_at: p.mm_locked_at ?? 0,
+    settled: outcome.settled,
+    settlement_block: null,
+    defaulted: outcome.defaulted,
+    user_signature: p.userSig ?? "0x",
+    mm_signature: p.mmSig,
+  };
+  log({
+    event: "writing_trade_record",
+    deal_hash: p.dealHashHex,
+    settled: outcome.settled,
+    defaulted: outcome.defaulted,
+  });
+  try {
+    const r = await reputation.publish(record);
+    log({
+      event: "trade_record_published",
+      deal_hash: p.dealHashHex,
+      record_root: r.recordHash,
+      index_root: r.indexHash,
+      ens_tx: r.ensTx,
+    });
+  } catch (err) {
+    log({
+      event: "trade_record_publish_error",
+      deal_hash: p.dealHashHex,
+      err: (err as Error).message,
+    });
   }
 }
 

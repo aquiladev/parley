@@ -12,7 +12,9 @@
     "clean": "rm -rf dist *.tsbuildinfo"
   },
   "dependencies": {
+    "@0gfoundation/0g-ts-sdk": "^1.2.6",
     "@parley/shared": "workspace:*",
+    "ethers": "^6.13.0",
     "viem": "^2.21.0"
   },
   "devDependencies": {

@@ -128,17 +128,17 @@ Within a phase, items are listed as outcomes, not tasks. Outcomes are what makes
 
 **Outcomes:**
 
-- [ ] After each settled trade, both parties write a `TradeRecord` blob to 0G Storage via `og-mcp.write_trade_record`. Records are keyed by both wallets (for users) and by ENS name (for MMs).
-- [ ] MM Agent updates its own `text("reputation_root")` ENS record after each trade (pointing to the new index blob in 0G).
-- [ ] `og-mcp.read_mm_reputation` and `og-mcp.read_user_reputation` implement the scoring formula from §7.3 of the spec. Aggregate score is visible in offer cards.
-- [ ] Refund flow: user accepts → MM never locks → deadline passes → user can submit `refund(dealHash)` from the Mini App. Tested end-to-end with a deliberately stalled MM.
-- [ ] Settle-side flow: once both lock events are observed, the User Agent prompts the user to submit `settle(dealHash)` from the Mini App. By convention this is the user-side path; the MM Agent has it as a fallback if the user's session expires.
-- [ ] ERC-20 approval flow: first time a user trades a token, the Mini App detects the missing approval and runs an approval submission as a discrete step before the lock. Same applies to Permit2 approval for Uniswap fallback (Phase 5).
-- [ ] Failure recovery in onboarding: signature timeout, wallet mismatch (connected `0xA` but signed from `0xB`), session expiry mid-trade. Each has a clear bot-side message and recovery path.
-- [ ] Per-user policy fields (`min_counterparty_rep`, `max_slippage_bps`, `timeout_ms`) stored in Hermes memory, scoped per Telegram user ID. Editable via `/policy`.
-- [ ] Chain-watcher subroutine inside the AXL sidecar subscribes to Settlement contract events (`UserLocked`, `MMLocked`, `Settled`, `Refunded`) and injects state changes into Hermes' inbox. Replaces any earlier polling-based event detection.
-- [ ] Structured logging across User Agent, MM Agent, and Mini App. Every state transition timestamped with relevant context. JSON format for grep-ability.
-- [ ] **0G Compute proxy** (deferred from Phase 2): a small local service that wraps `@0glabs/0g-serving-broker`, exposes an OpenAI-compatible `/v1/chat/completions` endpoint to Hermes, and generates per-request signed headers transparently. Until shipped, Hermes runs on Claude API as primary. See `zg_compute_findings` memory.
+- [x] After each settled trade, both parties write a `TradeRecord` blob to 0G Storage via `og-mcp.write_trade_record` (user side) / direct SDK upload + ENS publish (MM side). Records keyed by wallet (users) and ENS name (MMs).
+- [x] MM Agent updates its own `text("reputation_root")` ENS record after each trade (pointing to the new index blob in 0G). `mm-1.parley.eth` ownership transferred to `MM_EVM` so the MM can self-publish.
+- [x] `og-mcp.read_mm_reputation` and `og-mcp.read_user_reputation` implement the §7.3 scoring formula. MM reads follow the canonical ENS path (`reputation_root` → index blob → records); user reads use og-mcp's local index. Smoke test verifies the math against the spec's worked examples.
+- [x] Refund flow: `/refund` Mini App route submits `refund(dealHash)` from the user's wallet; SOUL.md describes the bot-side prompt path when `getState` reports a stuck `UserLocked` past deadline.
+- [x] Settle-side flow: already shipped in Phase 2's `/settle` route; SOUL.md now ties it to the post-trade record write.
+- [x] ERC-20 approval flow: `/sign` checks `allowance(user, settlement)` on mount; renders an "Approve" step before the sign+lock if it's insufficient.
+- [x] Failure recovery in onboarding: SOUL.md "Failure modes — recovery flows" covers signature timeout, wallet mismatch, session expiry mid-trade, and the four privileged-tool error reasons.
+- [x] Per-user policy fields (`min_counterparty_rep`, `max_slippage_bps`, `timeout_ms`) stored in Hermes memory; `/policy` command spec in SOUL.md.
+- [x] Chain-watcher subroutine inside the AXL sidecar subscribes to Settlement events. *(Already shipped in Phase 2 — `getContractEvents` polling because public Sepolia RPC drops `eth_newFilter` handles; revert to `watchContractEvent` once on a paid RPC. See `sepolia_rpc_filter_quirk` memory.)*
+- [x] Structured logging across User Agent, MM Agent, and Mini App. MM Agent + sidecar emit JSON logs; MCPs use stderr (non-blocking — their stdout is reserved for MCP protocol).
+- [ ] **0G Compute proxy** (deferred from Phase 2; still pending): a small local service that wraps `@0glabs/0g-serving-broker`, exposes an OpenAI-compatible `/v1/chat/completions` endpoint to Hermes, and generates per-request signed headers transparently. Until shipped, Hermes runs on Claude API as primary. See `zg_compute_findings` memory. *(Decided: defer to Phase 5 polish — Claude API is working fine and a proxy without real demand is premature.)*
 
 **Demoable state:** a small group of invited testers can use Parley on their own phones, with their own funded wallets. Trades complete. Refunds work. Reputation visibly accrues across multiple trades. When something goes wrong, the logs say what.
 

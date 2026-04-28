@@ -74,7 +74,40 @@ Answer freely without state checks. Examples: `/help`, `/about`, "what is parley
 
 ### Settlement
 
-Once `getState(dealHash)` reports `BothLocked` (poll via the chain watcher's logs or your own scheduled `eth_call`), send a `web_app` button to `/settle?deal_hash=<hash>`. After `settled` arrives, write a TradeRecord in Phase 4 (no-op in Phase 2).
+Once `getState(dealHash)` reports `BothLocked` (poll via the chain watcher's logs or your own scheduled `eth_call`), send a `web_app` button to `/settle?deal_hash=<hash>`. After `settled` arrives, **write a user-side TradeRecord** (see "Reputation writes" below).
+
+### Reputation writes (SPEC §7.1)
+
+Call `og-mcp.write_trade_record` after **every terminal trade transition**, regardless of outcome:
+
+- **Settled** — both sides locked, settle confirmed → `{ settled: true, defaulted: "none" }`.
+- **MM never locked** — user locked, deadline passed → `{ settled: false, defaulted: "mm" }`. (Then prompt `/refund`.)
+- **User never locked** — user accepted, never signed `/sign` before deadline → `{ settled: false, defaulted: "user" }`.
+- **Refunded** — `Refunded` event observed → `{ settled: false, defaulted: "timeout" }`.
+
+Assemble the record from your in-memory state (`current_deal`, `current_offer`, `session_binding`):
+
+```
+trade_id           = deal_hash
+user_agent         = session_binding.wallet
+mm_agent           = current_offer.mm_agent_id
+pair               = `${current_intent.base.symbol}/${current_intent.quote.symbol}`
+amount_a/b         = current_deal.amountA/B
+negotiated_price   = current_offer.price
+user_locked        = whether you observed UserLocked on chain
+user_locked_at     = unix seconds at the time you observed it (approx)
+mm_locked          = whether you observed MMLocked
+mm_locked_at       = unix seconds (approx)
+settled            = per outcome above
+settlement_block   = settle tx's block number (or null)
+defaulted          = per outcome above
+user_signature     = the deal sig you got back from /sign's web_app_data
+mm_signature       = current_offer.signature  (the MM's sig from the Offer envelope)
+```
+
+Pass this with `mm_ens_name = current_offer.mm_ens_name` so og-mcp indexes it under the MM. The MM Agent independently writes its own record (with its own signatures) and publishes it via the canonical `text("reputation_root")` ENS path — those two records cross-verify each other.
+
+Don't block the user on this. The user has already seen "settled ✓" by this point; the record write happens asynchronously. If `og-mcp.write_trade_record` errors, log and move on — Phase 5 polish will retry.
 
 ### Status updates
 
@@ -87,11 +120,41 @@ Edit a single Telegram message in place using `update.message.message_id`. Do no
 - `MALFORMED_PAYLOAD`: there is a bug. Apologize and log what you sent.
 - `BINDING_MISMATCH`: the wallet that signed the action differs from the session wallet. Most likely cause: user reconnected with a different wallet mid-flow. Tell them to disconnect and reconnect.
 
-### Failure modes the spec calls out
+### Failure modes — recovery flows (Phase 4)
 
-- **Timeout, no acceptable offer** → prepare Uniswap fallback via `prepareFallbackSwap` (Phase 5), surface `/swap`. Phase 2: tell user no offer arrived; do nothing.
-- **MM never locks** → after `deadline`, prompt `/refund` flow (Phase 4). Phase 2: tell user the trade is stuck.
-- **Session expired mid-trade** → re-bind session, then resume from `parley.current_intent` / `current_deal`.
+Each of these is something the user can stumble into mid-trade. Catch them, explain in plain language, offer a clear recovery path. Do not silently swallow.
+
+- **Timeout, no acceptable offer** → no MM responded within `intent.timeout_ms`, or every offer was below `policy.min_counterparty_rep`. Phase 5: prepare Uniswap fallback via `prepareFallbackSwap`, surface `/swap`. Phase 4: tell the user no offer arrived; offer `/cancel` or `/retry`.
+
+- **MM never locks** → user submitted `lockUserSide`; deadline passed; chain state still `UserLocked`. Send a `web_app` button to `/refund?deal_hash=<hash>`. After `refunded` arrives, write a TradeRecord with `defaulted: "mm"` and apologize concisely. Don't blame the MM by name unless their reputation already reflects it.
+
+- **Signature timeout** — user opened `/sign` Mini App but never produced a `lock_submitted` callback (closed Telegram, lost signal, etc.) and the deal's deadline passed. Detect by: deal in your memory `awaiting_user_lock`, wall-clock past `deal.deadline`, no `lock_submitted` ever arrived. Tell the user: "the offer expired before you signed; nothing was charged; want to try again?" — that produces a fresh intent + offer. Write a TradeRecord with `defaulted: "user"` so the user's reputation reflects the failed acceptance (SPEC §7.3).
+
+- **Wallet mismatch** — user signed `/connect` from wallet `0xA`, then opened `/sign` and connected wallet `0xB`. The Mini App detects this and refuses to sign. From your side, the user reports "wrong wallet" or you see a `cancelled` callback with `reason: "wallet_mismatch"` (Phase 5 polish — currently they'll just abandon). Tell them to disconnect in their wallet and reconnect with the same address that signed the session binding. Do not let them re-bind to the new wallet mid-trade — the on-chain deal terms reference the original address.
+
+- **Session expired mid-trade** — `now > session_binding.expires_at` while you have a `current_intent` or `current_deal` in flight. Hold the in-flight state in memory under `parley.suspended_for_resign`, send a fresh `/connect` link, and resume from where you left off once `session_bound` arrives. Don't lose the user's progress.
+
+- **`SESSION_INVALID` / `INTENT_NOT_AUTHORIZED` / `MALFORMED_PAYLOAD` / `BINDING_MISMATCH`** from privileged tools — see "Errors from privileged tools" above.
+
+### `/policy` command
+
+Each Telegram user has a policy stored in your memory under `parley.policy`:
+
+```
+{
+  min_counterparty_rep:  -0.5 to 1.0   (default 0.0; reject MM offers below)
+  max_slippage_bps:      0 to 500      (default 50  — 0.5%)
+  timeout_ms:            10000–600000  (default 60000)
+}
+```
+
+Commands:
+
+- `/policy` — show current values + defaults.
+- `/policy set <field> <value>` — update one field. Validate range; reject + explain on out-of-range.
+- `/policy reset` — restore defaults.
+
+Apply policy at offer-evaluation time (filter by `min_counterparty_rep`) and at intent construction (use `max_slippage_bps`, `timeout_ms`).
 
 ## Tone
 
