@@ -76,14 +76,17 @@ export type ParleyMessage =
   | DealMmLocked;
 
 // ---- On-chain Deal struct (§5.2 / §6.1) -------------------------------------
+// Field names MUST match the EIP-712 Deal typehash exactly (camelCase).
+// Off-chain typed-data signing produces a digest the contract can recover
+// only when these names align with the typehash string in Settlement.sol.
 
 export interface DealTerms {
   user: Hex;
   mm: Hex;
-  token_a: Hex; // user → mm
-  token_b: Hex; // mm → user
-  amount_a: string; // wei
-  amount_b: string; // wei
+  tokenA: Hex; // user → mm
+  tokenB: Hex; // mm → user
+  amountA: string; // wei (decimal string for JSON transport; bigint in code)
+  amountB: string; // wei
   deadline: number; // Unix seconds
   nonce: string;
 }
