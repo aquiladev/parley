@@ -88,8 +88,8 @@ export function buildOffer(
     amount: intent.amount,
     expiry: deadline,
     settlement_window_ms: cfg.settlementWindowMs,
-    // Phase 1: signature field carries the MM's EIP-712 sig over the Deal,
-    // populated by the caller via signDeal() before transmission.
+    deal,
+    // EIP-712 sig over `deal`, populated by the caller via signDeal().
     signature: "0x",
   };
 

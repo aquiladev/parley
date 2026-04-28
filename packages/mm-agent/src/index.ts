@@ -10,7 +10,7 @@
 //   - peer discovery is whoever sends us an intent (no ENS, no fan-out)
 //   - chain state polling, not event subscription (Phase 4 swaps in viem.watchContractEvent)
 
-import { parseAbi, type Hex } from "viem";
+import { encodeFunctionData, parseAbi, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import type {
   Accept,
@@ -37,6 +37,13 @@ const POLL_INTERVAL_MS = 2_000;
 
 const SETTLEMENT_ABI = parseAbi([
   "function getState(bytes32 dealHash) external view returns (uint8)",
+]);
+
+const ERC20_ABI = parseAbi([
+  "function balanceOf(address owner) view returns (uint256)",
+  "function allowance(address owner, address spender) view returns (uint256)",
+  "function approve(address spender, uint256 amount) returns (bool)",
+  "function mint(address to, uint256 amount)",
 ]);
 
 // Mirror of Settlement.sol's DealState enum.
@@ -130,6 +137,11 @@ async function main(): Promise<void> {
     settlementWindowMs: env.settlementWindowMs,
   };
 
+  // Phase 1 only: against TestERC20 mocks, self-mint inventory if low and
+  // approve Settlement to spend it. Production MM operators fund their hot
+  // wallet out-of-band and approve once.
+  await ensureMmFundedAndApproved(cfg, wallet);
+
   const topo = await axl.topology();
   log({
     event: "boot",
@@ -201,7 +213,13 @@ async function handleIntent(
   axl: AxlClient,
   pending: Map<string, PendingDeal>,
 ): Promise<void> {
-  log({ event: "intent_received", intent_id: intent.id, side: intent.side });
+  log({
+    event: "intent_received",
+    intent_id: intent.id,
+    side: intent.side,
+    from_header: fromPeerId,
+    from_field: intent.from_axl_pubkey,
+  });
 
   const prepared = buildOffer(intent, cfg);
   if (!prepared) {
@@ -217,17 +235,22 @@ async function handleIntent(
   const offer: Offer = { ...prepared.offer, signature: sig };
   const dealHashHex = digest(prepared.deal, cfg);
 
+  // Reply destination = the user's full AXL pubkey from the intent body, not
+  // the prefix-padded X-From-Peer-Id header form (whose routability as a
+  // destination is empirically unverified). See `axl_transport_quirks` memory.
+  const replyTo = intent.from_axl_pubkey;
+
   pending.set(offer.id, {
     offer,
     deal: prepared.deal,
     dealHashHex,
     outflow: prepared.outflow,
-    counterpartyPeerId: fromPeerId,
+    counterpartyPeerId: replyTo,
     mmSig: sig,
     state: "awaiting_accept",
   });
 
-  await axl.send(fromPeerId, JSON.stringify(offer));
+  await axl.send(replyTo, JSON.stringify(offer));
   log({
     event: "offer_sent",
     intent_id: intent.id,
@@ -357,6 +380,91 @@ async function sweepPending(
         chain_state: onchainState,
       });
       pending.delete(offerId);
+    }
+  }
+}
+
+async function ensureMmFundedAndApproved(
+  cfg: NegotiatorConfig,
+  wallet: MmWallet,
+): Promise<void> {
+  const targets: Array<{ token: Hex; symbol: string; target: bigint }> = [
+    {
+      token: cfg.knownTokens.usdc.address,
+      symbol: "USDC",
+      target: cfg.inventory.usdc,
+    },
+    {
+      token: cfg.knownTokens.weth.address,
+      symbol: "WETH",
+      target: cfg.inventory.weth,
+    },
+  ];
+
+  for (const t of targets) {
+    if (t.target === 0n) continue; // operator chose not to quote in this token
+
+    const balance = (await wallet.publicClient.readContract({
+      address: t.token,
+      abi: ERC20_ABI,
+      functionName: "balanceOf",
+      args: [wallet.address],
+    })) as bigint;
+
+    if (balance < t.target) {
+      const mintAmount = t.target * 2n; // headroom for repeated runs
+      log({
+        event: "self_minting",
+        token: t.token,
+        symbol: t.symbol,
+        balance_wei: balance.toString(),
+        mint_wei: mintAmount.toString(),
+      });
+      const txHash = await wallet.walletClient.sendTransaction({
+        account: wallet.walletClient.account!,
+        chain: wallet.walletClient.chain,
+        to: t.token,
+        data: encodeFunctionData({
+          abi: ERC20_ABI,
+          functionName: "mint",
+          args: [wallet.address, mintAmount],
+        }),
+      });
+      await wallet.publicClient.waitForTransactionReceipt({
+        hash: txHash,
+        confirmations: 1,
+      });
+    }
+
+    const allowance = (await wallet.publicClient.readContract({
+      address: t.token,
+      abi: ERC20_ABI,
+      functionName: "allowance",
+      args: [wallet.address, cfg.settlementContract],
+    })) as bigint;
+
+    // Approve unlimited (Phase 1; cap-and-reapprove pattern is Phase 4 polish).
+    if (allowance < t.target) {
+      log({
+        event: "approving",
+        token: t.token,
+        symbol: t.symbol,
+        spender: cfg.settlementContract,
+      });
+      const txHash = await wallet.walletClient.sendTransaction({
+        account: wallet.walletClient.account!,
+        chain: wallet.walletClient.chain,
+        to: t.token,
+        data: encodeFunctionData({
+          abi: ERC20_ABI,
+          functionName: "approve",
+          args: [cfg.settlementContract, 2n ** 256n - 1n],
+        }),
+      });
+      await wallet.publicClient.waitForTransactionReceipt({
+        hash: txHash,
+        confirmations: 1,
+      });
     }
   }
 }

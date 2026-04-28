@@ -59,9 +59,9 @@ Within a phase, items are listed as outcomes, not tasks. Outcomes are what makes
 
 - [x] `Settlement.sol` written and deployed to Sepolia. Foundry tests cover the lock-lock-settle path and the lock-then-refund path. EIP-712 typehash verified.
 - [x] MM Agent skeleton: TypeScript daemon with hardcoded inventory and spread, AXL listener using the polling pattern, deterministic pricing (`uniswap_twap * (1 + spread_bps/10000)`), EIP-712 signing of `Deal` typed data, direct `viem` submission of `lockMMSide` from a faucet-funded hot wallet
-- [ ] User Agent skeleton: a Node.js script (not Hermes) that broadcasts a hardcoded intent over AXL, evaluates the first offer it receives, and signs `lockUserSide` using a script-controlled EOA private key — *this is a Phase 1 shortcut and gets removed in Phase 2*
-- [ ] Peer discovery is hardcoded via `KNOWN_MM_AXL_PUBKEYS` env var. No ENS resolution. No `og-mcp.resolve_mm` call.
-- [ ] One trade settles end-to-end. Both parties' balances change as expected. `Settled` event observable on Sepolia.
+- [x] User Agent skeleton: a Node.js script (not Hermes) that broadcasts a hardcoded intent over AXL, evaluates the first offer it receives, and signs `lockUserSide` using a script-controlled EOA private key — *this is a Phase 1 shortcut and gets removed in Phase 2*
+- [x] Peer discovery is hardcoded via `KNOWN_MM_AXL_PUBKEYS` env var. No ENS resolution. No `og-mcp.resolve_mm` call.
+- [x] One trade settles end-to-end. Both parties' balances change as expected. `Settled` event observable on Sepolia.
 
 **Demoable state:** terminal-only demo. Run two processes (User Agent script and MM Agent daemon), watch logs, see "trade settled, here's the tx hash." Not pretty, but the architectural spine is proven.
 

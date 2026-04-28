@@ -15,6 +15,11 @@ export interface Intent {
   type: "intent.broadcast";
   id: string; // UUID v4
   agent_id: Hex; // Wallet address of the user
+  /** Sender's AXL ed25519 public key (full 64-hex). Required because AXL's
+   *  X-From-Peer-Id header carries a prefix-padded routing form, not the
+   *  raw key — see memory `axl_transport_quirks.md`. The MM Agent uses
+   *  this value as X-Destination-Peer-Id when replying with an Offer. */
+  from_axl_pubkey: string;
   timestamp: number;
   side: "buy" | "sell";
   base: TokenRef;
@@ -36,6 +41,12 @@ export interface Offer {
   amount: string; // What the MM commits to fill
   expiry: number; // Unix seconds
   settlement_window_ms: number;
+  /** Full on-chain deal terms — the user verifies + signs over this exact
+   *  struct. Must match what the MM also signs (and what the contract's
+   *  dealHash() will recompute). */
+  deal: DealTerms;
+  /** EIP-712 signature of `deal` by `mm_agent_id`. The MM submits this same
+   *  sig on-chain via lockMMSide; the user just verifies it before accepting. */
   signature: Hex;
 }
 

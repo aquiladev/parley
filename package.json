@@ -17,7 +17,8 @@
     "contracts:test": "pnpm -F @parley/contracts test",
     "miniapp:dev": "pnpm -F @parley/miniapp dev",
     "user-agent:dev": "pnpm -F @parley/user-agent dev",
-    "mm-agent:dev": "pnpm -F @parley/mm-agent dev"
+    "mm-agent:dev": "pnpm -F @parley/mm-agent dev",
+    "git:unlock": "find .git -name '*.lock' -type f -delete && echo 'cleared'"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

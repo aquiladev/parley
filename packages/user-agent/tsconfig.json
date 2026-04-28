@@ -4,6 +4,6 @@
     "outDir": "dist",
     "composite": true
   },
-  "include": ["lib/**/*", "axl-sidecar/**/*"],
+  "include": ["lib/**/*", "axl-sidecar/**/*", "scripts/**/*"],
   "references": [{ "path": "../shared" }]
 }

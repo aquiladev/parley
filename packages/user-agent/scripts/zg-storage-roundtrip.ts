@@ -66,8 +66,16 @@ try {
     );
     if (uploadErr !== null) throw new Error(`upload: ${uploadErr}`);
 
-    rootHash = "rootHash" in tx ? tx.rootHash : tx.rootHashes[0];
-    txHash = "txHash" in tx ? tx.txHash : tx.txHashes[0];
+    if ("rootHash" in tx) {
+      rootHash = tx.rootHash;
+      txHash = tx.txHash;
+    } else {
+      const rh = tx.rootHashes[0];
+      const th = tx.txHashes[0];
+      if (!rh || !th) throw new Error("upload returned empty hashes array");
+      rootHash = rh;
+      txHash = th;
+    }
     console.log(`[zg-storage] upload ${Date.now() - startedUp}ms tx=${txHash}`);
     console.log(`[zg-storage] rootHash=${rootHash}`);
   } finally {

@@ -40,7 +40,10 @@ if (!PRIVATE_KEY) {
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
-const broker = await createZGComputeNetworkBroker(wallet);
+// Cast: ethers ESM Wallet vs broker SDK's CJS Wallet expectation — runtime
+// shape is identical, see `zg_compute_findings` memory.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const broker = await createZGComputeNetworkBroker(wallet as any);
 
 let providerAddr = CONFIGURED_PROVIDER;
 if (!providerAddr) {
@@ -49,7 +52,12 @@ if (!providerAddr) {
     console.error("No 0G Compute services available. Check the marketplace.");
     process.exit(1);
   }
-  providerAddr = services[0].provider;
+  const first = services[0];
+  if (!first) {
+    console.error("services[0] missing — provider list returned empty");
+    process.exit(1);
+  }
+  providerAddr = first.provider;
   console.log(
     `[zg-compute] ZG_COMPUTE_PROVIDER unset; defaulting to first available: ${providerAddr}`,
   );
