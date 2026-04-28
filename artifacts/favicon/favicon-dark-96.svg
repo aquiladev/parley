@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-label="Parley">
+  <rect width="96" height="96" rx="17.280" fill="#0F0F12"/>
+  <g fill="none" stroke="#FFFFFF" stroke-linecap="round">
+    <path d="M 41.280 15.360 A 32.640 32.640 0 0 0 41.280 80.640" stroke-width="9.600"/>
+    <path d="M 54.720 15.360 A 32.640 32.640 0 0 1 54.720 80.640" stroke-width="6.400"/>
+  </g>
+</svg>

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="170" height="166" viewBox="0 0 170 166" role="img" aria-label="Parley">
+  <g transform="translate(37.0 12)">
+    <g fill="none" stroke="currentColor" stroke-linecap="round">
+  <path d="M 41.280 15.360 A 32.640 32.640 0 0 0 41.280 80.640" stroke-width="9.600"/>
+  <path d="M 54.720 15.360 A 32.640 32.640 0 0 1 54.720 80.640" stroke-width="6.400"/>
+</g>
+  </g>
+  <text x="85.0" y="144.0" text-anchor="middle" dominant-baseline="central"
+        font-family='system-ui, -apple-system, "Segoe UI", Inter, "Helvetica Neue", Arial, sans-serif' font-size="28" font-weight="500"
+        letter-spacing="2.5" fill="currentColor">parley</text>
+</svg>
