@@ -12,7 +12,7 @@ There are **eight logical processes**, hosted across three machines (or three Do
 
 | Host | Process | Language | Purpose |
 |---|---|---|---|
-| User Agent host | Hermes Agent | TS (LLM-driven) | Telegram gateway, MCP host, per-user state |
+| User Agent host | Hermes Agent | **Python** (LLM-driven) | Telegram gateway, MCP host, per-user state. System-installed (`curl \| bash`); state in `~/.hermes/`. |
 | | `axl-mcp` | TS (MCP server) | Hermes ↔ AXL bridge; privileged tool validation |
 | | `og-mcp` | TS (MCP server) | Hermes ↔ 0G Storage + ENS |
 | | `axl-sidecar` | TS | Polls `GET /recv`, injects msgs into Hermes; chain-watcher |
@@ -43,10 +43,10 @@ Every variable in `.env.example` mapped to consumers. Empty cell = not needed.
 | `KNOWN_MM_ENS_NAMES` | ✓ |  |  | Comma-separated MM ENS names the User Agent fans out to. |
 | `PARLEY_ROOT_PRIVATE_KEY` | — | — | — | **One-time scripts only** (`register-mm.ts`). Never in any runtime container. |
 | `TELEGRAM_BOT_TOKEN` | ✓ |  |  |  |
-| `ZG_COMPUTE_ENDPOINT` | (✓) |  |  | Pending Phase 2 decision: direct broker SDK vs Claude API fallback. See `zg_compute_findings` memory. |
-| `ZG_COMPUTE_KEY` | (✓) |  |  | Same. |
-| `ZG_COMPUTE_PROVIDER` | (✓) |  |  | Provider address acknowledged via 0g-compute-cli. |
-| `ANTHROPIC_API_KEY` | ✓ |  |  | Spec-documented LLM fallback; may become primary. |
+| `ZG_COMPUTE_ENDPOINT` | (✓) |  |  | **Phase 2 decision: deferred.** Used only after the 0G Compute proxy ships in Phase 4 (per `zg_compute_findings` memory: per-request signed headers, no static API key). Optional until then. |
+| `ZG_COMPUTE_KEY` | (✓) |  |  | Same — unused by Hermes directly. |
+| `ZG_COMPUTE_PROVIDER` | (✓) |  |  | Same. |
+| `ANTHROPIC_API_KEY` | ✓ |  |  | **Phase 2 primary LLM.** Hermes points at Claude API directly. Required. |
 | `ZG_STORAGE_RPC_URL` | ✓ | ✓ |  | Reads (User Agent reputation lookups) + writes (both: trade records). |
 | `ZG_STORAGE_INDEXER_URL` | ✓ | ✓ |  |  |
 | `OG_PRIVATE_KEY` | ✓ | ✓ |  | Pays storage uploads (and Compute, for the User Agent). Each agent should have **its own** key in production — don't share one wallet across the User Agent and MM Agent. |
@@ -103,10 +103,13 @@ Step 2 (per release):
   - cd ~/GitHub/axl && make build         # produces ./node binary; copy into images
 
 Step 3 (image build):
-  - User Agent image: Node 24 base + Go binary copied in + dist/ + hermes-config/
-  - MM Agent image: Node 24 base + Go binary + dist/
-  - Mini App image: Node 24 base + .next/ + public/
+  - User Agent image: Python 3.11+ base (for Hermes) + Node 24 (for MCPs) + Go binary
+                      + MCP dist/ + hermes-config/ → mounted into Hermes' ~/.hermes/
+  - MM Agent image:   Node 24 base + Go binary + dist/
+  - Mini App image:   Node 24 base + .next/ + public/
 ```
+
+**Hermes packaging note:** Hermes installs system-wide via the upstream `install.sh` (Python project, not vendored as a submodule). For the User Agent container we either (a) bake the install into the image's Dockerfile via `RUN curl | bash`, or (b) use the upstream's `docker-compose.yml` and mount our config + MCP binaries as volumes. Decide in Phase 5 once Hermes' deployment surface is exercised.
 
 **`NEXT_PUBLIC_*` gotcha:** these are inlined into the client JS bundle by webpack at build time. They cannot be changed after `next build` without rebuilding. Concretely:
 
@@ -183,6 +186,8 @@ Add explicit `depends_on` + healthchecks — agents should fail fast if their AX
 - **Backups.** The two `axl.pem` files and the deployer wallet PKs are the only true non-recreatable state. Cold backup somewhere outside the host.
 - **Rotation.** Plan for rotating `MM_EVM_PRIVATE_KEY` (drain, redeploy with new key, update ENS `addr` record, restart). Plan for rotating `axl.pem` (new key, re-register `axl_pubkey` text record, restart).
 - **Telegram rate limits.** Mitigation per spec: edit messages instead of sending new ones for live status updates. If 429s appear, basic backoff.
+- **Hermes DM pairing for production.** During Phase 2 dev we set `unauthorized_dm_behavior: ignore` to silence pairing prompts on a single-user dev box. **Production deploy must reverse this** — either re-enable pairing (default) and approve users via `hermes pairing approve telegram <CODE>`, or curate `TELEGRAM_ALLOWED_USERS` in `~/.hermes/.env` with the explicit Telegram user IDs allowed to talk to the bot. Without one of those, anyone who finds the bot's username gets nothing (silent black hole) — fine for staging, but degrades the demo onboarding experience. See `hermes_pairing_flow` memory for the full flow.
+- **Multi-user isolation verification.** Phase 2 baseline (ROADMAP §1 outcome 1) requires confirming Hermes' per-Telegram-user state isolation works under load — two test accounts, simultaneous sessions, no context leakage. Deferred during dev; **must be checked before declaring Phase 2 closed for any external tester**.
 
 ---
 
@@ -190,7 +195,8 @@ Add explicit `depends_on` + healthchecks — agents should fail fast if their AX
 
 Open questions to resolve as Phase 2-5 lands. Each becomes a section here when answered.
 
-- **Hermes persistence model.** Does session memory survive process restarts? If not, what does graceful container reload look like?
+- **Hermes persistence model.** Does session memory survive process restarts? Hermes' state lives at `~/.hermes/` — we'll know during Phase 2 baseline whether per-user state is durable across restarts. If not, that drives the volume layout.
+- **Hermes config layout.** Phase 2 baseline produces `~/.hermes/config.toml` (or equivalent) interactively via `hermes setup`. Need to decide whether to (a) check the resulting config into the repo as-is and mount it, or (b) re-run `hermes setup` per-environment. Likely (a) for reproducibility but (b) for secrets hygiene — split the config from the secrets.
 - **Single-machine vs split deployment.** Demo cost of running everything on one VPS vs. cleanly separating User Agent and MM Agent infra. (One-VPS is fine for the demo.)
 - **Mini App secret handling for `MINIAPP_JWT_SIGNING_KEY`.** Random per-deploy or stable? Stable means JWTs survive deploys — preferable for in-flight sessions.
 - **AXL node listen vs NAT.** Demo can run all nodes NAT'd behind the existing public Gensyn nodes. Production should run at least one Parley-operated public AXL peer for resilience.

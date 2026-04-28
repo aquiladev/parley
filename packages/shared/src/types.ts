@@ -147,3 +147,56 @@ export const DEAL_EIP712_TYPES = {
     { name: "nonce", type: "uint256" },
   ],
 } as const;
+
+// ---- Privileged-tool auth (§4.3) --------------------------------------------
+// Three off-chain EIP-712 signatures that gate privileged MCP tool calls.
+//   - SessionBinding: signed once at `/connect`, valid 24h. Binds a Telegram
+//                     user_id to a wallet address.
+//   - IntentAuthorization: signed per `broadcast_intent` call.
+//   - AcceptAuthorization: signed per `send_accept` call.
+//
+// Same domain as Deal so wallets render them with the same project name.
+
+export const SESSION_BINDING_EIP712_TYPES = {
+  SessionBinding: [
+    { name: "telegram_user_id", type: "uint64" },
+    { name: "wallet", type: "address" },
+    { name: "expires_at", type: "uint64" },
+  ],
+} as const;
+
+export const INTENT_AUTHORIZATION_EIP712_TYPES = {
+  IntentAuthorization: [
+    { name: "intent_id", type: "string" },
+    { name: "telegram_user_id", type: "uint64" },
+    { name: "issued_at", type: "uint64" },
+  ],
+} as const;
+
+export const ACCEPT_AUTHORIZATION_EIP712_TYPES = {
+  AcceptAuthorization: [
+    { name: "offer_id", type: "string" },
+    { name: "deal_hash", type: "bytes32" },
+    { name: "telegram_user_id", type: "uint64" },
+    { name: "issued_at", type: "uint64" },
+  ],
+} as const;
+
+export interface SessionBinding {
+  telegram_user_id: string; // bigint as decimal string for JSON transport
+  wallet: Hex;
+  expires_at: number; // Unix seconds
+}
+
+export interface IntentAuthorization {
+  intent_id: string;
+  telegram_user_id: string;
+  issued_at: number;
+}
+
+export interface AcceptAuthorization {
+  offer_id: string;
+  deal_hash: Hex;
+  telegram_user_id: string;
+  issued_at: number;
+}

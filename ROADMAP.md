@@ -80,7 +80,7 @@ Within a phase, items are listed as outcomes, not tasks. Outcomes are what makes
 
 **Outcomes:**
 
-- [ ] Hermes Agent installed and configured. Basic Telegram bot replies to messages using 0G Compute as the LLM backend. Per-user session memory works (verified by manual multi-user test).
+- [ ] Hermes Agent installed and configured. Basic Telegram bot replies to messages using **Claude API** as the LLM backend (per the spec's documented fallback). 0G Compute is deferred to Phase 4: its auth model uses per-request signed headers rather than a static API key, so it can't talk to Hermes directly without a local broker-wrapping proxy. See `zg_compute_findings` memory. Per-user session memory works (verified by manual multi-user test).
 - [ ] Custom MCPs implemented:
   - [ ] `axl-mcp` — `discover_peers`, `broadcast_intent`, `send_offer`, `send_accept`, `poll_inbox`, `get_topology`
   - [ ] `og-mcp` — `resolve_mm` (returns from a hardcoded map keyed by ENS name; same return shape it'll have post-Phase-3), `read_mm_reputation` (returns neutral score 0.0 for now), `read_user_reputation` (returns neutral)
@@ -138,6 +138,7 @@ Within a phase, items are listed as outcomes, not tasks. Outcomes are what makes
 - [ ] Per-user policy fields (`min_counterparty_rep`, `max_slippage_bps`, `timeout_ms`) stored in Hermes memory, scoped per Telegram user ID. Editable via `/policy`.
 - [ ] Chain-watcher subroutine inside the AXL sidecar subscribes to Settlement contract events (`UserLocked`, `MMLocked`, `Settled`, `Refunded`) and injects state changes into Hermes' inbox. Replaces any earlier polling-based event detection.
 - [ ] Structured logging across User Agent, MM Agent, and Mini App. Every state transition timestamped with relevant context. JSON format for grep-ability.
+- [ ] **0G Compute proxy** (deferred from Phase 2): a small local service that wraps `@0glabs/0g-serving-broker`, exposes an OpenAI-compatible `/v1/chat/completions` endpoint to Hermes, and generates per-request signed headers transparently. Until shipped, Hermes runs on Claude API as primary. See `zg_compute_findings` memory.
 
 **Demoable state:** a small group of invited testers can use Parley on their own phones, with their own funded wallets. Trades complete. Refunds work. Reputation visibly accrues across multiple trades. When something goes wrong, the logs say what.
 
