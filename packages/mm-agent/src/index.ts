@@ -160,9 +160,10 @@ async function main(): Promise<void> {
     settlementWindowMs: env.settlementWindowMs,
   };
 
-  // Phase 1 only: against TestERC20 mocks, self-mint inventory if low and
-  // approve Settlement to spend it. Production MM operators fund their hot
-  // wallet out-of-band and approve once.
+  // Ensure the hot wallet holds inventory and the Settlement contract has
+  // an allowance. On real Sepolia USDC/WETH there is no mint selector, so a
+  // shortfall aborts boot with an actionable funding hint; against legacy
+  // TestERC20 mocks (Phase 1 leftover), `mint()` succeeds and tops up.
   await ensureMmFundedAndApproved(cfg, wallet);
 
   const topo = await axl.topology();
@@ -555,20 +556,43 @@ async function ensureMmFundedAndApproved(
         balance_wei: balance.toString(),
         mint_wei: mintAmount.toString(),
       });
-      const txHash = await wallet.walletClient.sendTransaction({
-        account: wallet.walletClient.account!,
-        chain: wallet.walletClient.chain,
-        to: t.token,
-        data: encodeFunctionData({
-          abi: ERC20_ABI,
-          functionName: "mint",
-          args: [wallet.address, mintAmount],
-        }),
-      });
-      await wallet.publicClient.waitForTransactionReceipt({
-        hash: txHash,
-        confirmations: 1,
-      });
+      try {
+        const txHash = await wallet.walletClient.sendTransaction({
+          account: wallet.walletClient.account!,
+          chain: wallet.walletClient.chain,
+          to: t.token,
+          data: encodeFunctionData({
+            abi: ERC20_ABI,
+            functionName: "mint",
+            args: [wallet.address, mintAmount],
+          }),
+        });
+        await wallet.publicClient.waitForTransactionReceipt({
+          hash: txHash,
+          confirmations: 1,
+        });
+      } catch (err) {
+        // Real Sepolia USDC/WETH have no `mint()`; the call reverts. Fail loud
+        // with funding instructions rather than the raw revert message.
+        log({
+          event: "mint_unavailable_fund_externally",
+          token: t.token,
+          symbol: t.symbol,
+          balance_wei: balance.toString(),
+          target_wei: t.target.toString(),
+          hint:
+            t.symbol === "USDC"
+              ? "Sepolia USDC: claim from https://faucet.circle.com (select Sepolia)"
+              : t.symbol === "WETH"
+                ? "Sepolia WETH: send Sepolia ETH to 0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14 (auto-wraps via fallback)"
+                : "Fund the MM hot wallet manually",
+          underlying: (err as Error).message,
+        });
+        throw new Error(
+          `MM under-inventoried for ${t.symbol}: have ${balance}, need ${t.target}. ` +
+            `mint() unavailable on this token (likely real Sepolia ${t.symbol}). Fund the hot wallet externally and restart.`,
+        );
+      }
     }
 
     const allowance = (await wallet.publicClient.readContract({

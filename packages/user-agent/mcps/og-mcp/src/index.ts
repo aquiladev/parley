@@ -32,6 +32,11 @@ import {
   tallyUserStats,
 } from "./reputation.js";
 import { fetchMmIndexBlob, fetchTradeRecord, uploadTradeRecord } from "./storage.js";
+import {
+  computeSavingsBps,
+  getUniswapQuote,
+  prepareFallbackSwap,
+} from "./uniswap.js";
 
 const SEPOLIA_RPC_URL = process.env["SEPOLIA_RPC_URL"];
 if (!SEPOLIA_RPC_URL) {
@@ -359,6 +364,91 @@ server.registerTool(
   },
 );
 
+// ---- Uniswap tools (Phase 5) ------------------------------------------------
+
+const TokenRefSchema = z.object({
+  chain_id: z.number(),
+  address: z.string(),
+  symbol: z.string(),
+  decimals: z.number(),
+});
+
+// Subset of the full Intent envelope — `prepare_fallback_swap` and
+// `get_uniswap_reference_quote` only need the trade legs and slippage;
+// the rest of Intent (signatures, AXL pubkeys, etc.) is irrelevant here.
+const FallbackIntentSchema = z.object({
+  side: z.enum(["buy", "sell"]),
+  base: TokenRefSchema,
+  quote: TokenRefSchema,
+  amount: z.string(),
+  max_slippage_bps: z.number(),
+});
+
+server.registerTool(
+  "prepare_fallback_swap",
+  {
+    description:
+      "Build Uniswap calldata for a swap matching `intent`, executed from `user_address`'s wallet on Sepolia. Hits the Trading API's /check_approval, /quote, and /swap endpoints (SPEC §9.1). Returns { ok:true, value:{ to, data, value, approvalRequired?, permit2Required?, expectedInput, expectedOutput, route } } that the Mini App's /swap route consumes. On API/network error returns { ok:false, error } so the bot can degrade gracefully (no fallback button).",
+    inputSchema: {
+      intent: FallbackIntentSchema,
+      user_address: z.string(),
+    },
+  },
+  async ({ intent, user_address }) => {
+    const result = await prepareFallbackSwap(
+      intent as Parameters<typeof prepareFallbackSwap>[0],
+      user_address as `0x${string}`,
+    );
+    return {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      isError: !result.ok,
+    };
+  },
+);
+
+server.registerTool(
+  "get_uniswap_reference_quote",
+  {
+    description:
+      "Reference price for `intent` from Uniswap (no calldata-build step). Used during offer evaluation to compute 'saves X% vs Uniswap'. The Trading API v1 requires `swapper` even on quote-only calls — pass the user's session-bound wallet. Optionally pass `peer_amount_out_wei` to get savings_bps in the response. Returns { ok:true, value:{ amountOut, amountOutWei, amountInWei, effectivePrice, route, savings_bps_vs_peer? } } or { ok:false, error }.",
+    inputSchema: {
+      intent: FallbackIntentSchema,
+      swapper: z.string(),
+      peer_amount_out_wei: z.string().optional(),
+    },
+  },
+  async ({ intent, swapper, peer_amount_out_wei }) => {
+    const result = await getUniswapQuote(
+      intent as Parameters<typeof getUniswapQuote>[0],
+      swapper as `0x${string}`,
+    );
+    if (!result.ok) {
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        isError: true,
+      };
+    }
+    const enriched: Record<string, unknown> = { ...result.value };
+    if (peer_amount_out_wei !== undefined) {
+      try {
+        const peerWei = BigInt(peer_amount_out_wei);
+        const uniswapWei = BigInt(result.value.amountOutWei);
+        enriched["savings_bps_vs_peer"] = computeSavingsBps(peerWei, uniswapWei);
+      } catch (err) {
+        enriched["savings_bps_error"] = (err as Error).message;
+      }
+    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({ ok: true, value: enriched }, null, 2),
+        },
+      ],
+    };
+  },
+);
+
 async function fetchAllSafely(rootHashes: string[]): Promise<TradeRecord[]> {
   const results = await Promise.all(
     rootHashes.map(async (h) => {
@@ -379,5 +469,7 @@ const transport = new StdioServerTransport();
 await server.connect(transport);
 // stdout is reserved for MCP protocol; log to stderr.
 process.stderr.write(
-  "[og-mcp] connected (resolve_mm, read_mm_reputation, read_user_reputation)\n",
+  "[og-mcp] connected (resolve_mm, read_mm_reputation, read_user_reputation, " +
+    "write_trade_record, read_trade_history, prepare_fallback_swap, " +
+    "get_uniswap_reference_quote)\n",
 );

@@ -26,6 +26,7 @@ import {
 import { sendResult } from "../../lib/telegram";
 import { SEPOLIA_CHAIN_ID } from "../../lib/walletconnect";
 import { MiniAppHeader } from "../../lib/header";
+import { formatTxError } from "../../lib/tx-error";
 
 function AuthIntentInner() {
   const params = useSearchParams();
@@ -106,7 +107,7 @@ function AuthIntentInner() {
       sendResult({ kind: "intent_authorized", intent_id: intent.id, auth, sig });
       setDone(true);
     } catch (err) {
-      setError((err as Error).message);
+      setError(formatTxError(err));
     }
   }
 

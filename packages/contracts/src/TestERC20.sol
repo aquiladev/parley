@@ -7,7 +7,10 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 ///         can mint to themselves so users + MMs can fund themselves without
 ///         needing external faucet flows. Decimals are configurable to match
 ///         USDC (6) or WETH (18).
-/// @dev Not for mainnet use.
+/// @dev Not for mainnet use. Archived as of Phase 5 — the live demo runs
+///      against real Sepolia USDC (0x1c7D…7238) and WETH (0xfFf9…6B14).
+///      Kept for Settlement.t.sol, which doesn't care which ERC-20 it
+///      exercises.
 contract TestERC20 is ERC20 {
     uint8 private immutable _decimals;
 

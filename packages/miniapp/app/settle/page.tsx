@@ -22,6 +22,7 @@ import { parseAbi, type Hex } from "viem";
 import { sendResult } from "../../lib/telegram";
 import { SEPOLIA_CHAIN_ID } from "../../lib/walletconnect";
 import { MiniAppHeader } from "../../lib/header";
+import { formatTxError } from "../../lib/tx-error";
 
 const SETTLEMENT_ADDRESS = (process.env["NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS"] ??
   "0x0000000000000000000000000000000000000000") as Hex;
@@ -79,7 +80,7 @@ function SettleInner() {
       setStep("done");
       sendResult({ kind: "settled", txHash: tx, dealId: dealHash });
     } catch (err) {
-      setError((err as Error).message);
+      setError(formatTxError(err));
       setStep("idle");
     }
   }

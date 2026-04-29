@@ -35,6 +35,7 @@ import {
 import { sendResult } from "../../lib/telegram";
 import { SEPOLIA_CHAIN_ID } from "../../lib/walletconnect";
 import { MiniAppHeader } from "../../lib/header";
+import { formatTxError } from "../../lib/tx-error";
 
 const SETTLEMENT_ADDRESS = (process.env["NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS"] ??
   "0x0000000000000000000000000000000000000000") as Hex;
@@ -99,7 +100,7 @@ function SignInner() {
         setStep(a < BigInt(parsed.amountA) ? "needs_approval" : "idle");
       } catch (err) {
         if (cancelled) return;
-        setError((err as Error).message);
+        setError(formatTxError(err));
         setStep("idle");
       }
     })();
@@ -178,7 +179,7 @@ function SignInner() {
       setAllowance(MAX_UINT256);
       setStep("idle");
     } catch (err) {
-      setError((err as Error).message);
+      setError(formatTxError(err));
       setStep("needs_approval");
     }
   }
@@ -256,7 +257,7 @@ function SignInner() {
         accept_auth_sig: acceptAuthSig,
       });
     } catch (err) {
-      setError((err as Error).message);
+      setError(formatTxError(err));
       setStep("idle");
     }
   }

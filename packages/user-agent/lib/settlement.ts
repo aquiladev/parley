@@ -43,4 +43,5 @@ export function prepareLockUserSide(
   };
 }
 
-// TODO: prepareSettle, prepareRefund, prepareFallbackSwap — same shape.
+// TODO: prepareSettle, prepareRefund — same shape. (prepareFallbackSwap
+// lives in `mcps/og-mcp/src/uniswap.ts` since og-mcp is its only consumer.)

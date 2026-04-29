@@ -24,7 +24,7 @@ A user broadcasts an intent over [Gensyn AXL](https://github.com/gensyn-ai/axl);
 - **Mini App** — Next.js + WalletConnect + injected (MetaMask/Rabby/Coinbase), runs inside Telegram or any browser. The only place a user's wallet ever signs. Source: `packages/miniapp/`.
 - **Identity** — MMs as ENS subnames under `parley.eth` on Sepolia ([`mm-1.parley.eth`](https://sepolia.app.ens.domains/mm-1.parley.eth) is live with `addr` + `axl_pubkey` + `agent_capabilities` text records); users by wallet address.
 - **Reputation** — both MMs and users have on-chain-anchored reputation scores. See [Reputation](#reputation) below.
-- **Fallback** — Uniswap Trading API when no peer offer arrives. *(Phase 5.)*
+- **Fallback** — direct Uniswap v3 (QuoterV2 + SwapRouter02 on Sepolia) when no peer offer arrives; the same on-chain quoter anchors the "vs Uniswap" delta shown on every peer offer.
 
 A trade end-to-end:
 
@@ -126,7 +126,7 @@ The read code path is `og-mcp.read_mm_reputation` / `read_user_reputation`; the 
 | 2 | Telegram bot + Mini App + Hermes runtime + per-action signatures | ✅ done |
 | 3 | ENS identity layer — `mm-1.parley.eth` live on Sepolia | ✅ done |
 | 4 | Reputation, refunds, observability | ✅ done |
-| 5 | Uniswap fallback + polish | 🚧 next |
+| 5 | Uniswap fallback + polish | ✅ done |
 
 ## Running it
 
@@ -152,7 +152,7 @@ cloudflared tunnel --url http://localhost:3000   # → paste URL into MINIAPP_BA
 hermes gateway start
 ```
 
-Then send the bot "swap 50 mUSDC for mWETH" and walk through `/connect` → `/authorize-intent` → `/sign` → `/settle` in the Mini App.
+Then send the bot "swap 10 USDC for WETH" and walk through `/connect` → `/authorize-intent` → `/sign` → `/settle` in the Mini App. (Real Sepolia USDC/WETH; fund the user persona at [faucet.circle.com](https://faucet.circle.com) and wrap a little Sepolia ETH into WETH at `0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14`.)
 
 **One-shot scripts** (also useful as health checks): see `pnpm -F @parley/user-agent` for `phase0:zg-compute`, `phase0:zg-storage`, `phase3:register-mm`. The Phase 1 terminal-only demo script (`phase1-trade.ts`) was removed when Phase 2 took over user-side signing.
 

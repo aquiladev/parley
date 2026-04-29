@@ -153,13 +153,14 @@ Within a phase, items are listed as outcomes, not tasks. Outcomes are what makes
 
 **Outcomes:**
 
-- [ ] `prepareFallbackSwap` builds Uniswap calldata via `/check_approval` → `/quote` → `/swap` (the implementation from §9.1 of the spec).
-- [ ] Mini App `/swap` route: handles Permit2 approval (if needed) then submits the swap from the user's wallet via `wagmi.sendTransaction`. Returns tx hash to bot.
-- [ ] Reference price comparison: every peer offer shown to the user includes a "vs Uniswap" delta computed from the same `/quote` endpoint that powers fallback. The "saved 0.6% vs Uniswap" beat is anchored to a real measured number.
-- [ ] User Agent triggers fallback after `timeout_ms` with no acceptable offer (or all offers below `max_slippage_bps`). User is prompted to submit the fallback swap; if they decline, the intent expires.
-- [ ] Mini App polish: handle picker UI for the optional `/register` path (if not already in Phase 3), proper loading states, clear error messages on tx failures.
-- [ ] Bot polish: `/help`, `/policy`, `/balance`, `/history`, `/logout`, `/reset` commands all work and return useful output. `/register <handle>` and `/unregister` if not already shipped.
-- [ ] Optional `/register` opt-in user flow shipped, if Phase 3 didn't already cover it.
+- [x] `prepareFallbackSwap` builds Uniswap v3 calldata directly: probes QuoterV2 across standard fee tiers (100/500/3000/10000), picks the best route, encodes a `SwapRouter02.exactInputSingle` call with slippage-protected `amountOutMinimum`. Lives at `packages/user-agent/mcps/og-mcp/src/uniswap.ts`. **Note: pivoted from the Trading API approach in §9.1 because Uniswap's gateway doesn't index Sepolia v3 pools** — same architectural goal, on-chain implementation. SPEC.md §9.1 left as an alternate-path reference; the canonical implementation is on-chain.
+- [x] Mini App `/swap` route: handles ERC-20 approval to SwapRouter02 (if needed) then submits the swap from the user's wallet via `wagmi.sendTransaction`. Returns tx hash to bot.
+- [x] Reference price comparison: `og-mcp.get_uniswap_reference_quote` reads QuoterV2 on-chain so SOUL.md's offer-evaluation step can surface "saves 0.X% vs Uniswap" against a real number.
+- [x] User Agent triggers fallback after `timeout_ms` with no acceptable offer. SOUL.md "Timeout, no acceptable offer" recovery flow now drives the live `/swap` button (no peer-system TradeRecord — fallback is unrelated to peer rep).
+- [x] Mini App polish: shared `formatTxError` helper distinguishes wallet-rejection / allowance / RPC / revert errors across all routes (`lib/tx-error.ts`).
+- [x] Bot polish: `/help`, `/policy`, `/balance`, `/history`, `/logout`, `/reset` specced in SOUL.md "Other commands (Phase 5)".
+- [x] Token migration: real Sepolia USDC (`0x1c7D…7238`) / WETH (`0xfFf9…6B14`) now drive both peer trades and fallback. MM Agent boot-fails with funding hints if the hot wallet is under-inventoried (real tokens have no `mint()`). Phase-1 TestERC20 contracts archived.
+- [ ] Optional `/register` opt-in user flow → **deferred to long-term backlog** (cross-wallet rep portability isn't load-bearing for the demo; revisit when an external tester asks).
 
 **Demoable state:** the demo Aquila would actually want to show another person. Fallback works visibly. Numbers tell a real "saved X% vs Uniswap" story. The bot conversation feels intentional, not stitched together. Onboarding takes ~30 seconds for a wallet-ready user.
 

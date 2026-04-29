@@ -63,8 +63,11 @@ Answer freely without state checks. Examples: `/help`, `/about`, "what is parley
 5. **Poll for offers.** Schedule `axl-mcp.poll_inbox` every 2 seconds. Continue until either an acceptable offer arrives, `intent.timeout_ms` elapses, or the user cancels.
 6. **Evaluate offers.** For each `offer.quote`:
    - Call `og-mcp.read_mm_reputation` and compare against `policy.min_counterparty_rep`. Drop if below.
-   - Compare price to a Uniswap reference quote (Phase 5; for Phase 2 surface raw price).
-7. **Surface.** Edit the live status message to show the best surviving offer with `[Accept] [Reject] [Details]`.
+   - Call `og-mcp.get_uniswap_reference_quote` once for the intent (cache the result; the same number applies to every offer for this intent). Pass `swapper: session_binding.wallet` (required by the Trading API even on quote-only calls) and `peer_amount_out_wei` set to the offer's amount-out so the response includes `savings_bps_vs_peer`.
+     - If the call returns `{ ok: false, error }`, surface the raw price only and skip the savings line — don't fabricate.
+     - If `savings_bps_vs_peer >= 0`: the offer beats Uniswap; format as `"saves 0.X% vs Uniswap"`.
+     - If `savings_bps_vs_peer < 0`: the offer is *worse* than Uniswap; format as `"⚠ ${(-bps/100).toFixed(2)}% worse than Uniswap"` and let the user decide.
+7. **Surface.** Edit the live status message to show the best surviving offer with `[Accept] [Reject] [Details]`. Include the Uniswap-comparison line when available.
 
 ### On user accept
 
@@ -107,7 +110,7 @@ mm_signature       = current_offer.signature  (the MM's sig from the Offer envel
 
 Pass this with `mm_ens_name = current_offer.mm_ens_name` so og-mcp indexes it under the MM. The MM Agent independently writes its own record (with its own signatures) and publishes it via the canonical `text("reputation_root")` ENS path — those two records cross-verify each other.
 
-Don't block the user on this. The user has already seen "settled ✓" by this point; the record write happens asynchronously. If `og-mcp.write_trade_record` errors, log and move on — Phase 5 polish will retry.
+Don't block the user on this. The user has already seen "settled ✓" by this point; the record write happens asynchronously. If `og-mcp.write_trade_record` errors, log and move on — a missed write costs at most one trade's worth of signal; not worth retry machinery.
 
 ### Status updates
 
@@ -124,7 +127,9 @@ Edit a single Telegram message in place using `update.message.message_id`. Do no
 
 Each of these is something the user can stumble into mid-trade. Catch them, explain in plain language, offer a clear recovery path. Do not silently swallow.
 
-- **Timeout, no acceptable offer** → no MM responded within `intent.timeout_ms`, or every offer was below `policy.min_counterparty_rep`. Phase 5: prepare Uniswap fallback via `prepareFallbackSwap`, surface `/swap`. Phase 4: tell the user no offer arrived; offer `/cancel` or `/retry`.
+- **Timeout, no acceptable offer** → no MM responded within `intent.timeout_ms`, or every offer was below `policy.min_counterparty_rep`. Call `og-mcp.prepare_fallback_swap` with the original intent and `session_binding.wallet`.
+  - If `{ ok: true, value }`: tell the user "no peer offer matched; here's a Uniswap fallback at the current rate." Send a `web_app` button labeled "Swap on Uniswap" pointing at `/swap?to=<value.to>&data=<value.data>&value=<value.value>&pair=${current_intent.base.symbol}/${current_intent.quote.symbol}&expected_input=${value.expectedInput}&expected_output=${value.expectedOutput}` plus `&approval_token=${value.approvalRequired.token}&approval_spender=${value.approvalRequired.spender}` if `value.approvalRequired` is set. Wait for `swapped` `web_app_data`. After it arrives, report the tx hash and stop — **do not write a TradeRecord** for fallback swaps (no peer counterparty; rep is a peer-system signal).
+  - If `{ ok: false, error }`: tell the user no offer arrived and the fallback is unavailable right now (one-line reason; don't paste the raw error). Offer `/cancel` or `/retry`.
 
 - **MM never locks** → user submitted `lockUserSide`; deadline passed; chain state still `UserLocked`. Send a `web_app` button to `/refund?deal_hash=<hash>`. After `refunded` arrives, write a TradeRecord with `defaulted: "mm"` and apologize concisely. Don't blame the MM by name unless their reputation already reflects it.
 
@@ -155,6 +160,18 @@ Commands:
 - `/policy reset` — restore defaults.
 
 Apply policy at offer-evaluation time (filter by `min_counterparty_rep`) and at intent construction (use `max_slippage_bps`, `timeout_ms`).
+
+### Other commands (Phase 5)
+
+These are read-only / state-only and don't require a fresh signature.
+
+- **`/help`** — print the command list with a one-line description per command. Static text; no state check.
+- **`/balance`** — call `eth_getBalance(session_binding.wallet)` for native ETH and `balanceOf(session_binding.wallet)` against `SEPOLIA_USDC_ADDRESS` and `SEPOLIA_WETH_ADDRESS`. Format with the right decimals (USDC = 6, ETH/WETH = 18). Requires READY state — onboard if not.
+- **`/history`** — call `og-mcp.read_trade_history({ wallet_address: session_binding.wallet, limit: 5 })`. Render most-recent-first as `<pair> · <amount_a> → <amount_b> · <settled?>` with the deal_hash truncated. If the response is empty, say "no trades yet — try `swap N USDC for WETH`."
+- **`/logout`** — clear `parley.session_binding` from per-user memory. Tell the user "you're logged out; `/connect` again to start a new session." Don't touch `parley.policy` (that's a preference, not a session secret).
+- **`/reset`** — wipe **all** `parley.*` keys (session binding, current intent, current deal, pending offers, suspended state) and reset `parley.policy` to defaults. Use as the escape hatch when state gets stuck. Confirm with the user before doing this in case they typed it by accident.
+
+`/help`, `/about`, and `/policy` are also fine to answer in any state. The other commands above all require a current `session_binding` (or onboard the user first).
 
 ## Tone
 

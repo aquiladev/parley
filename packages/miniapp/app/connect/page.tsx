@@ -26,6 +26,7 @@ import {
 import { sendResult } from "../../lib/telegram";
 import { SEPOLIA_CHAIN_ID } from "../../lib/walletconnect";
 import { MiniAppHeader } from "../../lib/header";
+import { formatTxError } from "../../lib/tx-error";
 
 const SESSION_LIFETIME_SECONDS = 24 * 3600;
 
@@ -65,7 +66,7 @@ function ConnectInner() {
       sendResult({ kind: "session_bound", wallet: address, sig, expires_at: expiresAt });
       setDone(true);
     } catch (err) {
-      setSignError((err as Error).message);
+      setSignError(formatTxError(err));
     }
   }
 

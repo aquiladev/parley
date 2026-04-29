@@ -101,5 +101,38 @@ if (process.env["OG_PRIVATE_KEY"]) {
   console.log("\n(write_trade_record skipped: set OG_PRIVATE_KEY to exercise the upload path)");
 }
 
+// ---- Phase 5: Uniswap fallback + reference price ---------------------------
+//
+// Skipped without UNISWAP_API_KEY since the Trading API rejects unauthed calls.
+
+const SEPOLIA_USDC = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
+const SEPOLIA_WETH = "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14";
+const fakeIntent = {
+  side: "buy" as const,
+  base: { chain_id: 11155111, address: SEPOLIA_WETH, symbol: "WETH", decimals: 18 },
+  quote: { chain_id: 11155111, address: SEPOLIA_USDC, symbol: "USDC", decimals: 6 },
+  amount: "10",
+  max_slippage_bps: 50,
+};
+
+// Uniswap v3 on-chain quoter + swap-builder. Needs SEPOLIA_RPC_URL only —
+// no API key. Sepolia v3 pools (e.g., USDC/WETH at 0x3289…) provide the
+// liquidity; QuoterV2 (0xEd1f…) returns the route, SwapRouter02 (0x3bFA…)
+// is the spender we encode calldata against.
+const fakeSwapper = "0xabcdef1234567890abcdef1234567890abcdef12";
+console.log("\nget_uniswap_reference_quote(Sepolia 10 USDC -> WETH):");
+const rq = await client.callTool({
+  name: "get_uniswap_reference_quote",
+  arguments: { intent: fakeIntent, swapper: fakeSwapper },
+});
+console.log(JSON.stringify(rq, null, 2));
+
+console.log("\nprepare_fallback_swap(Sepolia 10 USDC -> WETH):");
+const rs = await client.callTool({
+  name: "prepare_fallback_swap",
+  arguments: { intent: fakeIntent, user_address: fakeSwapper },
+});
+console.log(JSON.stringify(rs, null, 2));
+
 await client.close();
 console.log("\n[og-mcp] smoke test ok");

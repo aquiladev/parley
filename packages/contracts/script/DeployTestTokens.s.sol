@@ -7,6 +7,9 @@ import {TestERC20} from "../src/TestERC20.sol";
 /// @notice Phase 1 only. Deploys mock USDC + WETH on Sepolia and mints a
 ///         healthy starting balance to the deployer. Anyone can subsequently
 ///         self-mint via TestERC20.mint().
+/// @dev Archived as of Phase 5 — the live demo runs against real Sepolia
+///      USDC and WETH (see docs/deployment.md). Don't run this script for
+///      a fresh deploy; fund from faucets instead.
 contract DeployTestTokens is Script {
     function run() external returns (TestERC20 usdc, TestERC20 weth) {
         uint256 mintUsdc = 1_000_000 * 1e6; // 1,000,000 mUSDC (6dp)
