@@ -127,6 +127,8 @@ The read code path is `og-mcp.read_mm_reputation` / `read_user_reputation`; the 
 | 3 | ENS identity layer — `mm-1.parley.eth` live on Sepolia | ✅ done |
 | 4 | Reputation, refunds, observability | ✅ done |
 | 5 | Uniswap fallback + polish | ✅ done |
+| 6 | Containerized deployment (local Docker → single VPS) | 🚧 next |
+| 7 | Second MM Agent + competitive offer cards | ⏭ planned |
 
 ## Running it
 

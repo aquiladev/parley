@@ -166,6 +166,106 @@ Within a phase, items are listed as outcomes, not tasks. Outcomes are what makes
 
 ---
 
+## Phase 6 — Containerized deployment
+ 
+**Estimate:** 4–6 days, split across two sub-phases (local Docker validation, then single-VPS deployment)
+**Tester readiness:** Sepolia open access — same as Phase 5, but now self-hostable rather than tethered to a developer's laptop
+ 
+**Goal:** convert the Phase-5 demo from "works on the developer's machine" to "deploys reproducibly on a server." Three Dockerfiles, a `compose.yml`, the operational hygiene to run unattended.
+ 
+This phase is grounded in `deployment.md`, the working document that tracks deployment shape, environment variables, persistent state, build pipeline, networking, and external configuration. Phase 6 turns that document's open items into committed artifacts.
+ 
+### Phase 6a — Local Docker validation (2–3 days)
+ 
+**Goal:** the entire stack runs end-to-end on the developer's laptop using `docker compose up`. No remote server involved yet — this sub-phase exists specifically to surface containerization issues without conflating them with VPS-deployment issues.
+ 
+**Outcomes:**
+ 
+- [ ] Three `Dockerfile`s in the repo:
+  - **User Agent image** — Python 3.11+ base for Hermes (installed via `RUN curl | bash`, pinned to a specific Hermes release for reproducibility), plus Node 24 for the MCP servers and AXL sidecar, plus the AXL Go binary copied in. Multi-stage build to keep the final image lean.
+  - **MM Agent image** — Node 24 base with the AXL Go binary and the compiled MM Agent.
+  - **Mini App image** — Node 24 base with `.next/` produced by `next build`. `NEXT_PUBLIC_*` values baked at build time per `deployment.md` §4.
+- [ ] A `compose.yml` that starts all three services with explicit `depends_on` and healthchecks. Order-of-start follows `deployment.md` §7.
+- [ ] A `.env.example` aligned with `deployment.md` §2. The single root-level `.env` is mounted read-only into containers; never `COPY`'d into images. Each service receives only the variables it actually needs.
+- [ ] Volume mounts for the persistent state listed in `deployment.md` §3: each agent's `axl.pem`, the Hermes state dir (`~/.hermes/`), and the Hermes config sync (SOUL.md and skills directory).
+- [ ] Per-service healthchecks: `curl /topology` for AXL nodes; equivalent endpoints for the agents.
+- [ ] Logo asset sync (`pnpm -F @parley/miniapp sync-assets`) wired into the Mini App image's build step. Skipping this ships stale icons; the build catches it.
+- [ ] A single `make deploy-local` (or equivalent) command that, from a fresh checkout with a populated `.env`, brings the stack up with one invocation.
+- [ ] The Hermes packaging decision committed: bake-install at a pinned version. Documented in the User Agent Dockerfile with the version pin called out.
+
+**Verification before moving to 6b:**
+
+- [ ] All three containers come up healthy on `docker compose up`
+- [ ] A real Telegram message round-trips through to Hermes and back
+- [ ] The Mini App is reachable on `localhost:<port>` and can complete a session-binding signature
+- [ ] A trade settles end-to-end (User Agent → MM Agent → Settlement → 0G Storage write) entirely inside the local Docker stack
+- [ ] Volume restart test: `docker compose down && docker compose up` preserves Hermes session bindings and AXL identities
+**Demoable state (6a):** Parley running locally on a single laptop via `docker compose up`. Same demo as Phase 5, now reproducible on any machine with Docker installed.
+ 
+### Phase 6b — Single-VPS deployment (2–3 days)
+ 
+**Goal:** the stack runs on a remote server, addressable via a stable HTTPS hostname for the Mini App, with the operational substrate in place to keep it running unattended.
+ 
+**Outcomes:**
+ 
+- [ ] Stable HTTPS hostname for the Mini App, with a Caddy (or equivalent) reverse proxy in front and automatic Let's Encrypt TLS. The hostname is added to:
+  - WalletConnect Cloud's project domain allowlist
+  - Telegram BotFather (`/setdomain` and the `web_app` URL on the bot's menu button)
+- [ ] AXL nodes configured to reach existing public Gensyn AXL peers (NAT'd is fine for the demo per `deployment.md` §9).
+- [ ] ENS subnames registered on Sepolia: `mm-N.parley.eth` minted via the registration script, with `addr`, `axl_pubkey`, and `agent_capabilities` text records set.
+- [ ] Multi-user isolation verified under realistic load: two test Telegram accounts simultaneously, distinct sessions, no context leakage. This is the gate before opening the bot to anyone outside the team — see `deployment.md` §8.
+- [ ] Hermes pairing re-enabled in production (or `TELEGRAM_ALLOWED_USERS` curated explicitly). The dev-time `unauthorized_dm_behavior: ignore` setting is reversed.
+- [ ] The external-configuration runbook from `deployment.md` §6 walked through deliberately: WalletConnect allowlist, BotFather setup, bot avatar uploaded, ENS records confirmed, Sepolia funding for the MM hot wallet, GitHub social preview image set.
+- [ ] Backups in place for the truly non-recreatable state: both `axl.pem` files and the deployer wallet private key, stored cold and externally to the host.
+- [ ] Rotation runbooks drafted (not necessarily exercised) for: `MM_EVM_PRIVATE_KEY` (drain → redeploy with new key → update ENS `addr` → restart) and `axl.pem` (new key → re-register `axl_pubkey` text record → restart).
+- [ ] NTP confirmed running on the host. EIP-712 deadlines depend on accurate clocks.
+- [ ] Logging committed to a destination — at minimum, JSON to stdout with `docker logs` reachable. An aggregator is welcome but not required.
+
+**Verification before declaring 6b complete:**
+
+- [ ] The bot is reachable on Telegram via its production handle
+- [ ] The Mini App loads at the production HTTPS hostname
+- [ ] A trade completes end-to-end with the developer's own wallet, on the deployed instance
+- [ ] Two test Telegram users, simultaneous sessions, isolation holds (no context leakage between sessions)
+- [ ] `docker compose restart user-agent` preserves all in-flight state
+**Demoable state (6b):** Parley running on a server, addressable by anyone with the bot's Telegram handle. Self-hostable. Operationally honest — backups, monitoring, isolation verified.
+ 
+### What Phase 6 deliberately does not do
+ 
+- **Does not add CI/CD.** Push-to-deploy is a separate operational maturity step. Phase 6 leaves deploy as a manual `make deploy` invocation triggered from the developer's machine. CI/CD is on the post-Phase-7 backlog.
+- **Does not add metrics dashboards.** Logs to `docker logs` are the floor; an aggregated dashboard is welcome but explicitly out of scope. Phase 6 is "self-hostable," not "production-grade observability."
+- **Does not split User Agent and MM Agent across hosts.** Single VPS, three containers. The split-deployment posture is a future operational concern.
+- **Does not handle protocol upgrades / rolling restarts.** A `docker compose restart user-agent` will drop in-flight Mini App signing flows. Mitigating that requires session-state persistence beyond what's specced. Out of scope for Phase 6; on the operational-maturity backlog.
+---
+ 
+## Phase 7 — Second MM Agent and competitive offer cards
+ 
+**Estimate:** 1–2 days
+**Tester readiness:** same as Phase 6 — but the demo now visibly shows what Parley actually is
+ 
+**Goal:** make it visible that Parley is a multi-MM marketplace by running two MMs with distinct configurations and showing competing offers in the Telegram offer card.
+ 
+**Outcomes:**
+ 
+- [ ] A second MM Agent (`mm-2.parley.eth`) registered on Sepolia ENS via the registration script, with distinct `agent_capabilities` from `mm-1` (different max size, different pair set, or both — `deployment.md` §6 covers the registration step).
+- [ ] A second container in `compose.yml` running the same MM Agent code with different config: distinct `MM_EVM_PRIVATE_KEY`, different `MM_SPREAD_BPS`, different inventory targets. This validates that one MM Agent codebase can run as N independent operators with no shared state.
+- [ ] The User Agent's `KNOWN_MM_ENS_NAMES` env var updated to include both subnames; peer discovery resolves both in parallel and fans out intents to each.
+- [ ] The Telegram offer card updated to display competing offers side-by-side rather than a single offer:
+  - Each row shows the MM's ENS name, reputation score, price quoted, and the "vs Uniswap" delta
+  - The User Agent ranks them by composite score (price + reputation, weighted per `/policy`) and indicates the recommended pick
+  - The user picks; the picked offer proceeds through the standard accept/lock/settle flow
+  - The unpicked offer is recorded (not shown to the MM in v1.0; future iterations could feed it back as competitive signal)
+
+**Verification:**
+
+- [ ] Two MM Agents respond to a single intent broadcast within the negotiation timeout
+- [ ] The user sees both offers in one Telegram message, distinguished by ENS name
+- [ ] Picking one MM proceeds to settlement against that MM only; the other MM's offer expires cleanly
+- [ ] Reputation scores accrue independently for both MMs based on their settlement records
+**Demoable state:** the protocol's multi-MM premise is now visible in the demo. The user-facing pitch beat — "two market makers competed for your trade, your agent picked the better one" — is anchored in the actual UI rather than implied by the architecture diagram.
+ 
+---
+
 ## Risk register
 
 Things that could derail the build, with mitigations. Listed in approximate order of "this is the one I'd be most worried about."
