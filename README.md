@@ -23,7 +23,7 @@ A user broadcasts an intent over [Gensyn AXL](https://github.com/gensyn-ai/axl);
 - **MM Agent** — deterministic TypeScript daemon, *no LLM in the pricing path*. Source: `packages/mm-agent/`.
 - **Mini App** — Next.js + WalletConnect + injected (MetaMask/Rabby/Coinbase), runs inside Telegram or any browser. The only place a user's wallet ever signs. Source: `packages/miniapp/`.
 - **Identity** — MMs as ENS subnames under `parley.eth` on Sepolia ([`mm-1.parley.eth`](https://sepolia.app.ens.domains/mm-1.parley.eth) is live with `addr` + `axl_pubkey` + `agent_capabilities` text records); users by wallet address.
-- **Reputation** — `TradeRecord` blobs on 0G Storage; scores computed on demand, not stored. *(Phase 4.)*
+- **Reputation** — both MMs and users have on-chain-anchored reputation scores. See [Reputation](#reputation) below.
 - **Fallback** — Uniswap Trading API when no peer offer arrives. *(Phase 5.)*
 
 A trade end-to-end:
@@ -57,6 +57,66 @@ sequenceDiagram
 
 See [`SPEC.md`](SPEC.md) for the full protocol design.
 
+## Reputation
+
+Both MMs and users have reputation scores. They're computed live from trade history that lives on 0G Storage, anchored on-chain via ENS — nobody fabricates them. Scores are bounded `[-0.5, 1.0]`, and fresh accounts start at `0.0` (neutral, not negative — so a newcomer isn't penalized for not having a track record yet).
+
+### What you see
+
+When the bot surfaces an offer in Telegram, the MM's reputation is part of the card:
+
+```
+💱 Offer from mm-1.parley.eth
+   3,006 USDC per WETH  (vs Uniswap 2,994 — saves 0.4%)
+   Reputation 0.67  ·  10 settled  ·  0 timeouts
+```
+
+The MM sees an analogous summary about you when it decides whether to quote your intent.
+
+### How a score is computed
+
+Bayesian-smoothed (constant `5`), bounded `[-0.5, 1.0]`. Penalties: `0.5` per failed acceptance (user side) or per MM timeout (MM side). Smoothing keeps early scores honest — one good trade doesn't catapult a new account to 1.0.
+
+| Trades observed | Score |
+|---|---|
+| Fresh account | `0.00` |
+| 1 settled, 0 fails | `0.17` |
+| 10 settled, 0 fails | `0.67` |
+| 50 settled, 0 fails | `0.91` |
+| 10 settled, 2 user-side fails | `0.53` |
+
+Full math + edge cases in [`SPEC.md` §7.3](SPEC.md). Constants live at `packages/user-agent/mcps/og-mcp/src/reputation.ts`.
+
+### What counts (and what doesn't)
+
+- **MM "timeout"** — MM accepted your intent, you locked your tokens, MM never locked theirs before the deadline. You had to refund.
+- **User "failed acceptance"** — you accepted an offer in Telegram, then never signed `lockUserSide` in the Mini App before the deadline (closed the bot, lost signal, changed your mind silently).
+- **Not counted:** on-chain reverts (insufficient approval, RPC flake, etc.). The signal is too ambiguous to penalize an honest user for chain conditions.
+
+### Why you can trust it
+
+```mermaid
+flowchart LR
+    ENS["mm-1.parley.eth<br/>ENS subname<br/>(owner: MM hot wallet)"]
+    PTR["text(reputation_root)<br/>= 0xINDEXHASH"]
+    IDX["index blob on 0G Storage<br/>{ records: [0xRECORD1, 0xRECORD2, …] }"]
+    REC["TradeRecord blobs on 0G Storage<br/>(Merkle-rooted; verified on download)"]
+    SCORE["score(MM)<br/>computed live by og-mcp"]
+
+    ENS -->|"ENS read on Sepolia"| PTR
+    PTR -->|"download with Merkle proof"| IDX
+    IDX -->|"download with Merkle proof"| REC
+    REC -->|"§7.3 formula"| SCORE
+```
+
+Each hop is tamper-evident:
+
+- The **ENS subname** is owned by the MM's hot wallet — only the MM can rewrite the `reputation_root` pointer, and every update is a signed Sepolia transaction (publicly auditable).
+- 0G Storage downloads **verify the Merkle proof** against the indexer's commitment, so the bytes returned are provably the bytes uploaded.
+- **Both parties write a TradeRecord per trade** with the same `trade_id` (`= dealHash`). A misbehaving party leaves a contradicting record on the other side — visible to anyone who looks.
+
+The read code path is `og-mcp.read_mm_reputation` / `read_user_reputation`; the MM-side write path is `mm-agent/src/reputation-publisher.ts`.
+
 ## Status
 
 | Phase | Outcome | State |
@@ -65,8 +125,8 @@ See [`SPEC.md`](SPEC.md) for the full protocol design.
 | 1 | One trade settles end-to-end on Sepolia (terminal-only demo) | ✅ done |
 | 2 | Telegram bot + Mini App + Hermes runtime + per-action signatures | ✅ done |
 | 3 | ENS identity layer — `mm-1.parley.eth` live on Sepolia | ✅ done |
-| 4 | Reputation, refunds, observability | 🚧 next |
-| 5 | Uniswap fallback + polish | pending |
+| 4 | Reputation, refunds, observability | ✅ done |
+| 5 | Uniswap fallback + polish | 🚧 next |
 
 ## Running it
 
