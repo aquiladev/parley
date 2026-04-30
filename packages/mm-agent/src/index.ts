@@ -23,7 +23,8 @@ import type {
 } from "@parley/shared";
 
 import { AxlClient } from "./axl-client.js";
-import { loadInventoryFromEnv } from "./inventory.js";
+import { ensureAxlPubkeyOnEns } from "./axl-identity.js";
+import { fetchInventoryFromChain, loadReserveLimitsFromEnv } from "./inventory.js";
 import {
   buildOffer,
   digest,
@@ -93,7 +94,7 @@ function readEnv(): Env {
     privateKey: required("MM_EVM_PRIVATE_KEY") as Hex,
     spreadBps: Number(process.env["MM_SPREAD_BPS"] ?? "20"),
     ensName: process.env["MM_ENS_NAME"] ?? "mm-1.parley.eth",
-    offerExpiryMs: Number(process.env["MM_OFFER_EXPIRY_MS"] ?? "120000"),
+    offerExpiryMs: Number(process.env["MM_OFFER_EXPIRY_MS"] ?? "300000"),
     settlementWindowMs: Number(process.env["MM_SETTLEMENT_WINDOW_MS"] ?? "300000"),
     knownTokens: {
       usdc: { chain_id: 11155111, address: usdcAddr, symbol: "USDC", decimals: 6 },
@@ -141,7 +142,7 @@ async function main(): Promise<void> {
     privateKey: env.privateKey,
   });
 
-  const { inventory, limits } = loadInventoryFromEnv({
+  const limits = loadReserveLimitsFromEnv({
     usdcDecimals: env.knownTokens.usdc.decimals,
     wethDecimals: env.knownTokens.weth.decimals,
   });
@@ -153,18 +154,26 @@ async function main(): Promise<void> {
     settlementContract: env.settlementContract,
     chainId: env.chainId,
     privateKey: env.privateKey,
-    inventory,
     limits,
     knownTokens: env.knownTokens,
     offerExpiryMs: env.offerExpiryMs,
     settlementWindowMs: env.settlementWindowMs,
   };
 
-  // Ensure the hot wallet holds inventory and the Settlement contract has
-  // an allowance. On real Sepolia USDC/WETH there is no mint selector, so a
-  // shortfall aborts boot with an actionable funding hint; against legacy
-  // TestERC20 mocks (Phase 1 leftover), `mint()` succeeds and tops up.
+  // Approve the Settlement contract to spend our tokens. Inventory itself
+  // comes from chain `balanceOf` per-intent — there's no env-driven cap.
+  // Against legacy TestERC20 mocks (Phase 1 leftover) this also probes a
+  // best-effort `mint()` so devs running on those tokens don't have to fund
+  // manually; on real Sepolia USDC/WETH the mint reverts and we degrade.
   await ensureMmFundedAndApproved(cfg, wallet);
+
+  // Snapshot starting balance once for the boot log so the operator can
+  // sanity-check funding. Per-intent quoting reads its own snapshot.
+  const startingInventory = await fetchInventoryFromChain(
+    wallet.publicClient,
+    account.address,
+    env.knownTokens,
+  );
 
   const topo = await axl.topology();
   log({
@@ -173,12 +182,42 @@ async function main(): Promise<void> {
     ens_name: env.ensName,
     settlement: env.settlementContract,
     spread_bps: env.spreadBps,
-    inventory_usdc_wei: inventory.usdc.toString(),
-    inventory_weth_wei: inventory.weth.toString(),
+    on_chain_balance_usdc_wei: startingInventory.usdc.toString(),
+    on_chain_balance_weth_wei: startingInventory.weth.toString(),
+    min_usdc_reserve_wei: limits.min_usdc.toString(),
+    min_weth_reserve_wei: limits.min_weth.toString(),
     axl_url: env.axlHttpUrl,
     axl_pubkey: topo.ourPublicKey,
     axl_peers: topo.peers.length,
   });
+
+  // Self-heal ENS axl_pubkey. Default-on; opt-out via MM_AUTO_REGISTER_AXL=false.
+  // Mismatch happens whenever axl.pem rotates (fresh container, new operator,
+  // intentional rotation). Without this the User Agent dials a stale overlay
+  // IPv6 and broadcast_intent hangs in a 127s gVisor TCP SYN timeout.
+  const autoRegisterEnv = (process.env["MM_AUTO_REGISTER_AXL"] ?? "true").toLowerCase();
+  const autoRegister = !["false", "0", "no", "off"].includes(autoRegisterEnv);
+  try {
+    const r = await ensureAxlPubkeyOnEns(
+      {
+        mmEnsName: env.ensName,
+        rpcUrl: env.rpcUrl,
+        privateKey: env.privateKey,
+        axlHttpUrl: env.axlHttpUrl,
+        autoRegister,
+      },
+      log,
+    );
+    log({ event: "axl_identity_sync_done", status: r.status });
+  } catch (err) {
+    // Re-throw to fail boot — this is the right behavior for both
+    // autoRegister=false (operator must fix) AND for unexpected errors
+    // (better to crash than serve traffic with a broken identity).
+    process.stderr.write(
+      `[mm-agent] FATAL: axl identity sync failed: ${(err as Error).message}\n`,
+    );
+    throw err;
+  }
 
   // Active negotiations and chain submissions, keyed by offer id.
   const pending = new Map<string, PendingDeal>();
@@ -190,7 +229,7 @@ async function main(): Promise<void> {
       if (inbox) {
         const msg = parseMessage(inbox.body);
         if (msg) {
-          await dispatch(msg, inbox.fromPeerId, cfg, axl, pending);
+          await dispatch(msg, inbox.fromPeerId, cfg, wallet, axl, pending);
         } else {
           log({ event: "unparsable_message" });
         }
@@ -211,13 +250,14 @@ async function dispatch(
   msg: ParleyMessage,
   fromPeerId: string,
   cfg: NegotiatorConfig,
+  wallet: MmWallet,
   axl: AxlClient,
   pending: Map<string, PendingDeal>,
 ): Promise<void> {
   try {
     switch (msg.type) {
       case "intent.broadcast":
-        await handleIntent(msg, fromPeerId, cfg, axl, pending);
+        await handleIntent(msg, fromPeerId, cfg, wallet, axl, pending);
         break;
       case "offer.accept":
         handleAccept(msg, cfg, pending);
@@ -234,6 +274,7 @@ async function handleIntent(
   intent: Intent,
   fromPeerId: string,
   cfg: NegotiatorConfig,
+  wallet: MmWallet,
   axl: AxlClient,
   pending: Map<string, PendingDeal>,
 ): Promise<void> {
@@ -245,12 +286,23 @@ async function handleIntent(
     from_field: intent.from_axl_pubkey,
   });
 
-  const prepared = buildOffer(intent, cfg);
+  // Live chain read — the source of truth for what we actually have to trade.
+  // Decouples quoting decisions from any env-driven cap so a cold restart
+  // with the same hot wallet picks up exactly where the chain says we are.
+  const inventory = await fetchInventoryFromChain(
+    wallet.publicClient,
+    cfg.mmAddress,
+    cfg.knownTokens,
+  );
+
+  const prepared = buildOffer(intent, inventory, cfg);
   if (!prepared) {
     log({
       event: "intent_skipped",
       intent_id: intent.id,
-      reason: "unsupported_pair_or_inventory",
+      reason: "unsupported_pair_or_insufficient_balance",
+      on_chain_balance_usdc_wei: inventory.usdc.toString(),
+      on_chain_balance_weth_wei: inventory.weth.toString(),
     });
     return;
   }
@@ -342,21 +394,18 @@ async function sweepPending(
 ): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
   for (const [offerId, p] of pending) {
-    // Drop offers nobody accepted before the deadline. Pre-accept = no trade
-    // happened — nothing to record.
-    if (p.state === "awaiting_accept" && now >= p.deal.deadline) {
-      log({ event: "offer_expired", offer_id: offerId, deal_hash: p.dealHashHex });
-      pending.delete(offerId);
-      continue;
-    }
-
     if (p.state === "recorded") {
       pending.delete(offerId);
       continue;
     }
 
-    if (p.state !== "awaiting_user_lock" && p.state !== "mm_submitted") continue;
-
+    // Read chain state for every active offer, including those still in
+    // `awaiting_accept`. The AXL Accept message may be in flight or never
+    // coming — chain state is the source of truth. Without this probe, an
+    // Accept that arrives 1 second after our offer-expiry check causes us
+    // to silently drop the offer even though the user already locked
+    // funds on-chain. The user is then stuck refunding instead of getting
+    // a counter-locked, settle-able trade.
     let onchainState: number;
     try {
       onchainState = Number(
@@ -374,6 +423,40 @@ async function sweepPending(
         err: (err as Error).message,
       });
       continue;
+    }
+
+    // ---- awaiting_accept -------------------------------------------------
+    // Chain state takes priority over the Accept message. If the user
+    // already locked, promote regardless of whether the AXL Accept arrived
+    // (it may have raced our timer). If chain says nothing happened and
+    // the deadline has passed, this is a real expiry.
+    if (p.state === "awaiting_accept") {
+      if (
+        onchainState === STATE_USER_LOCKED ||
+        onchainState === STATE_BOTH_LOCKED
+      ) {
+        log({
+          event: "accept_implied_by_chain",
+          offer_id: offerId,
+          deal_hash: p.dealHashHex,
+          onchain_state: onchainState,
+          deadline_in_sec: p.deal.deadline - now,
+        });
+        p.state = "awaiting_user_lock";
+        if (p.user_locked_at === null) p.user_locked_at = now;
+        // fall through to the awaiting_user_lock branch below.
+      } else if (now >= p.deal.deadline) {
+        log({
+          event: "offer_expired",
+          offer_id: offerId,
+          deal_hash: p.dealHashHex,
+        });
+        pending.delete(offerId);
+        continue;
+      } else {
+        // Still within deadline, no on-chain action — keep waiting.
+        continue;
+      }
     }
 
     // ---- awaiting_user_lock ----------------------------------------------
@@ -394,7 +477,9 @@ async function sweepPending(
         if (p.user_locked_at === null) p.user_locked_at = now;
         try {
           const txHash = await lockMMSide(p.deal, p.mmSig, cfg, wallet);
-          cfg.inventory[p.outflow.token] -= p.outflow.amount;
+          // No in-memory inventory decrement: chain balance is the source of
+          // truth and `lockMMSide` itself moved tokens via transferFrom.
+          // Subsequent intents read fresh balance via fetchInventoryFromChain.
           p.mm_locked_at = Math.floor(Date.now() / 1000);
           p.state = "mm_submitted";
           log({
@@ -402,8 +487,8 @@ async function sweepPending(
             offer_id: offerId,
             deal_hash: p.dealHashHex,
             tx: txHash,
-            new_inventory_usdc_wei: cfg.inventory.usdc.toString(),
-            new_inventory_weth_wei: cfg.inventory.weth.toString(),
+            outflow_token: p.outflow.token,
+            outflow_amount_wei: p.outflow.amount.toString(),
           });
         } catch (err) {
           log({
@@ -524,37 +609,39 @@ async function ensureMmFundedAndApproved(
   cfg: NegotiatorConfig,
   wallet: MmWallet,
 ): Promise<void> {
-  const targets: Array<{ token: Hex; symbol: string; target: bigint }> = [
-    {
-      token: cfg.knownTokens.usdc.address,
-      symbol: "USDC",
-      target: cfg.inventory.usdc,
-    },
-    {
-      token: cfg.knownTokens.weth.address,
-      symbol: "WETH",
-      target: cfg.inventory.weth,
-    },
+  // Phase 6: chain balance is the source of truth. There's no env-driven
+  // "target" cap to compare against — we just (a) optionally probe-mint for
+  // dev TestERC20s when balance is 0, and (b) ensure the Settlement contract
+  // has unlimited allowance over whatever the wallet holds.
+  //
+  // Runs once at boot. Operator can top up afterward without a restart;
+  // re-running this function on each new fund would be redundant since
+  // unlimited approve is already in place.
+
+  const tokens: Array<{ token: Hex; symbol: string }> = [
+    { token: cfg.knownTokens.usdc.address, symbol: "USDC" },
+    { token: cfg.knownTokens.weth.address, symbol: "WETH" },
   ];
 
-  for (const t of targets) {
-    if (t.target === 0n) continue; // operator chose not to quote in this token
-
-    const balance = (await wallet.publicClient.readContract({
+  for (const t of tokens) {
+    let balance = (await wallet.publicClient.readContract({
       address: t.token,
       abi: ERC20_ABI,
       functionName: "balanceOf",
       args: [wallet.address],
     })) as bigint;
 
-    if (balance < t.target) {
-      const mintAmount = t.target * 2n; // headroom for repeated runs
+    // Best-effort dev convenience: if balance is 0, probe `mint()`. Works
+    // against legacy TestERC20s (Phase 1 mocks); reverts harmlessly on
+    // real Sepolia USDC/WETH where it's not authorized. No-throw on revert
+    // because real-token failure isn't an error condition for production.
+    if (balance === 0n) {
+      const probeMintAmount = t.symbol === "USDC" ? 10_000_000_000n : 10_000_000_000_000_000_000n;
       log({
-        event: "self_minting",
+        event: "attempting_self_mint",
         token: t.token,
         symbol: t.symbol,
-        balance_wei: balance.toString(),
-        mint_wei: mintAmount.toString(),
+        mint_wei: probeMintAmount.toString(),
       });
       try {
         const txHash = await wallet.walletClient.sendTransaction({
@@ -564,37 +651,45 @@ async function ensureMmFundedAndApproved(
           data: encodeFunctionData({
             abi: ERC20_ABI,
             functionName: "mint",
-            args: [wallet.address, mintAmount],
+            args: [wallet.address, probeMintAmount],
           }),
         });
         await wallet.publicClient.waitForTransactionReceipt({
           hash: txHash,
           confirmations: 1,
         });
-      } catch (err) {
-        // Real Sepolia USDC/WETH have no `mint()`; the call reverts. Fail loud
-        // with funding instructions rather than the raw revert message.
+        balance = (await wallet.publicClient.readContract({
+          address: t.token,
+          abi: ERC20_ABI,
+          functionName: "balanceOf",
+          args: [wallet.address],
+        })) as bigint;
         log({
-          event: "mint_unavailable_fund_externally",
-          token: t.token,
+          event: "self_mint_ok",
           symbol: t.symbol,
           balance_wei: balance.toString(),
-          target_wei: t.target.toString(),
+          minted_wei: balance.toString(),
+        });
+      } catch (err) {
+        // Expected on production tokens — degrade silently.
+        log({
+          event: "self_mint_unavailable",
+          token: t.token,
+          symbol: t.symbol,
           hint:
             t.symbol === "USDC"
-              ? "Sepolia USDC: claim from https://faucet.circle.com (select Sepolia)"
+              ? "Sepolia USDC: claim from https://faucet.circle.com and send to the MM hot wallet"
               : t.symbol === "WETH"
-                ? "Sepolia WETH: send Sepolia ETH to 0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14 (auto-wraps via fallback)"
+                ? "Sepolia WETH: send Sepolia ETH to 0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14 (auto-wraps) then transfer here"
                 : "Fund the MM hot wallet manually",
           underlying: (err as Error).message,
         });
-        throw new Error(
-          `MM under-inventoried for ${t.symbol}: have ${balance}, need ${t.target}. ` +
-            `mint() unavailable on this token (likely real Sepolia ${t.symbol}). Fund the hot wallet externally and restart.`,
-        );
       }
     }
 
+    // Approve unlimited regardless of current balance. This is a one-time
+    // setup so future external funding doesn't require a re-approve. If
+    // allowance is already at uint256.max we skip the tx.
     const allowance = (await wallet.publicClient.readContract({
       address: t.token,
       abi: ERC20_ABI,
@@ -602,13 +697,17 @@ async function ensureMmFundedAndApproved(
       args: [wallet.address, cfg.settlementContract],
     })) as bigint;
 
-    // Approve unlimited (Phase 1; cap-and-reapprove pattern is Phase 4 polish).
-    if (allowance < t.target) {
+    const MAX = 2n ** 256n - 1n;
+    // Reapprove if the current allowance is less than half of MAX — gives
+    // headroom against the (highly unlikely) case where the contract drained
+    // most of an unlimited approval.
+    if (allowance < MAX / 2n) {
       log({
         event: "approving",
         token: t.token,
         symbol: t.symbol,
         spender: cfg.settlementContract,
+        current_balance_wei: balance.toString(),
       });
       const txHash = await wallet.walletClient.sendTransaction({
         account: wallet.walletClient.account!,
@@ -617,7 +716,7 @@ async function ensureMmFundedAndApproved(
         data: encodeFunctionData({
           abi: ERC20_ABI,
           functionName: "approve",
-          args: [cfg.settlementContract, 2n ** 256n - 1n],
+          args: [cfg.settlementContract, MAX],
         }),
       });
       await wallet.publicClient.waitForTransactionReceipt({

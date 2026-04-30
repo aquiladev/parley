@@ -22,7 +22,9 @@ export interface NegotiatorConfig {
   settlementContract: Hex;
   chainId: number;
   privateKey: Hex;
-  inventory: Inventory;
+  /** Reserve floors per token. Quotes that would push a token below its
+   *  reserve are skipped. Default 0 / 0. Inventory is NOT cached here — it's
+   *  fetched live from chain per-intent and passed into `buildOffer`. */
   limits: InventoryLimits;
   /** Tokens the MM is willing to quote in. Phase 1: USDC + WETH. */
   knownTokens: { usdc: TokenRef; weth: TokenRef };
@@ -39,9 +41,13 @@ export interface PreparedOffer {
 }
 
 /** Decide whether to quote on `intent`, build a Deal, return the wire-form
- *  Offer + the Deal both parties will sign on-chain. */
+ *  Offer + the Deal both parties will sign on-chain. `inventory` is the live
+ *  on-chain `balanceOf` snapshot for the MM hot wallet (taken just before
+ *  this call). The caller is responsible for fetching it — see
+ *  `fetchInventoryFromChain` in inventory.ts. */
 export function buildOffer(
   intent: Intent,
+  inventory: Inventory,
   cfg: NegotiatorConfig,
 ): PreparedOffer | null {
   const pair = pairFromIntent(intent, cfg);
@@ -63,7 +69,7 @@ export function buildOffer(
     token: pair.userInIsWeth ? ("usdc" as const) : ("weth" as const),
     amount: sizing.amountB,
   };
-  if (!canFill(cfg.inventory, cfg.limits, outflow)) return null;
+  if (!canFill(inventory, cfg.limits, outflow)) return null;
 
   const deadline = Math.floor(Date.now() / 1000) + Math.floor(cfg.offerExpiryMs / 1000);
   const nonce = nonceFromIntent(intent.id);

@@ -1,6 +1,18 @@
-// Static inventory tracking. SPEC §4.2.
-// No rebalancing in v1.0. Reject intents that exceed available balance or
-// that would push reserves below configured minimums.
+// Inventory accounting for the MM Agent.
+//
+// As of Phase 6, the MM consults on-chain `balanceOf` for the source of
+// truth — there's no env-driven inventory cap, no in-memory mutable
+// "remaining capacity". The chain says what we have; if a quote can't be
+// honored, `lockMMSide` reverts and we drop the pending deal. SPEC §4.2 is
+// satisfied without the operator having to keep `MM_INVENTORY_*` vars in
+// sync with the wallet's actual balance.
+//
+// Optional `MM_MIN_USDC_RESERVE` / `MM_MIN_WETH_RESERVE` env vars (in
+// human units, e.g. "100" = 100 USDC) let an operator hold something
+// aside, but default to 0.
+
+import { erc20Abi, type Address } from "viem";
+import type { TokenRef } from "@parley/shared";
 
 export interface Inventory {
   usdc: bigint;
@@ -22,30 +34,52 @@ export function canFill(
   return remaining >= min;
 }
 
-/** Load inventory from env. Values in env are human-readable (e.g.
- *  `MM_INVENTORY_USDC=10000` = 10,000 USDC), converted to wei here using
- *  the configured token decimals. */
-export function loadInventoryFromEnv(opts: {
+interface ChainReader {
+  readContract: (args: {
+    address: Address;
+    abi: typeof erc20Abi;
+    functionName: "balanceOf";
+    args: [Address];
+  }) => Promise<bigint>;
+}
+
+/** Read the MM's live ERC-20 balance for both quoted tokens. Called per-intent
+ *  so quoting decisions reflect the wallet's actual state, not stale env
+ *  config. Returns wei amounts. */
+export async function fetchInventoryFromChain(
+  publicClient: ChainReader,
+  walletAddress: Address,
+  knownTokens: { usdc: TokenRef; weth: TokenRef },
+): Promise<Inventory> {
+  const [usdc, weth] = await Promise.all([
+    publicClient.readContract({
+      address: knownTokens.usdc.address as Address,
+      abi: erc20Abi,
+      functionName: "balanceOf",
+      args: [walletAddress],
+    }),
+    publicClient.readContract({
+      address: knownTokens.weth.address as Address,
+      abi: erc20Abi,
+      functionName: "balanceOf",
+      args: [walletAddress],
+    }),
+  ]);
+  return { usdc, weth };
+}
+
+/** Optional reserve floors. Defaults to no reserve. Operator who wants to
+ *  keep some balance aside (e.g., to manually rebalance later) can set
+ *  `MM_MIN_USDC_RESERVE=100` to floor at 100 USDC. */
+export function loadReserveLimitsFromEnv(opts: {
   usdcDecimals: number;
   wethDecimals: number;
-  minUsdcReserveBps?: number; // basis points of starting balance to keep aside
-  minWethReserveBps?: number;
-}): { inventory: Inventory; limits: InventoryLimits } {
-  const usdcRaw = process.env["MM_INVENTORY_USDC"] ?? "0";
-  const wethRaw = process.env["MM_INVENTORY_WETH"] ?? "0";
-
-  const usdc = parseUnitsHuman(usdcRaw, opts.usdcDecimals);
-  const weth = parseUnitsHuman(wethRaw, opts.wethDecimals);
-
-  const usdcBps = opts.minUsdcReserveBps ?? 0;
-  const wethBps = opts.minWethReserveBps ?? 0;
-
+}): InventoryLimits {
+  const usdcRaw = process.env["MM_MIN_USDC_RESERVE"] ?? "0";
+  const wethRaw = process.env["MM_MIN_WETH_RESERVE"] ?? "0";
   return {
-    inventory: { usdc, weth },
-    limits: {
-      min_usdc: (usdc * BigInt(usdcBps)) / 10000n,
-      min_weth: (weth * BigInt(wethBps)) / 10000n,
-    },
+    min_usdc: parseUnitsHuman(usdcRaw, opts.usdcDecimals),
+    min_weth: parseUnitsHuman(wethRaw, opts.wethDecimals),
   };
 }
 
