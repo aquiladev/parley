@@ -228,6 +228,150 @@ server.registerTool(
   },
 );
 
+// ---- intent builder -------------------------------------------------------
+
+// Sepolia token registry the agent can refer to by symbol. The MM Agent
+// quotes the same pair, so keeping this table in sync with the MM side is
+// load-bearing — bake into env if it grows.
+const SEPOLIA_USDC = (process.env["SEPOLIA_USDC_ADDRESS"] ??
+  "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238") as Hex;
+const SEPOLIA_WETH = (process.env["SEPOLIA_WETH_ADDRESS"] ??
+  "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14") as Hex;
+
+interface TokenSpec {
+  chain_id: number;
+  address: Hex;
+  symbol: string;
+  decimals: number;
+}
+
+const TOKEN_BY_SYMBOL: Record<string, TokenSpec> = {
+  USDC: { chain_id: 11155111, address: SEPOLIA_USDC, symbol: "USDC", decimals: 6 },
+  WETH: { chain_id: 11155111, address: SEPOLIA_WETH, symbol: "WETH", decimals: 18 },
+  // "ETH" is shorthand for WETH in this demo — Settlement.sol moves ERC-20s,
+  // not native ETH. The user means WETH; resolve transparently.
+  ETH:  { chain_id: 11155111, address: SEPOLIA_WETH, symbol: "WETH", decimals: 18 },
+};
+
+function uuidv4(): string {
+  // Avoid pulling in a uuid dep for one call. RFC4122 v4 manual implementation.
+  const bytes = new Uint8Array(16);
+  // crypto.getRandomValues is in node 20+ globalThis.crypto.
+  globalThis.crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const h = (n: number) => n.toString(16).padStart(2, "0");
+  const b = Array.from(bytes, h);
+  return [
+    b.slice(0, 4).join(""),
+    b.slice(4, 6).join(""),
+    b.slice(6, 8).join(""),
+    b.slice(8, 10).join(""),
+    b.slice(10, 16).join(""),
+  ].join("-");
+}
+
+server.registerTool(
+  "build_intent",
+  {
+    description:
+      "Construct a complete `Intent` envelope from user-facing inputs. Resolves token symbols (USDC, WETH, ETH→WETH) to Sepolia addresses, mints a fresh `id` (UUID v4), reads `from_axl_pubkey` from this AXL node's /topology, sets `timestamp`/`privacy`/`signature` defaults, and stamps `agent_id` from `user_wallet`. Returns { ok:true, intent } on success, { ok:false, error } otherwise. **Always call this before /authorize-intent and broadcast_intent — never hand-build the Intent JSON.**",
+    inputSchema: {
+      side: z.enum(["buy", "sell"]),
+      base_symbol: z.string().min(1),
+      quote_symbol: z.string().min(1),
+      amount: z.string().min(1),
+      max_slippage_bps: z.number().int().min(0).max(500).default(50),
+      timeout_ms: z.number().int().min(10_000).max(600_000).default(60_000),
+      min_counterparty_rep: z.number().min(-0.5).max(1).default(0),
+      user_wallet: Address,
+    },
+  },
+  async ({
+    side,
+    base_symbol,
+    quote_symbol,
+    amount,
+    max_slippage_bps,
+    timeout_ms,
+    min_counterparty_rep,
+    user_wallet,
+  }) => {
+    const base = TOKEN_BY_SYMBOL[base_symbol.toUpperCase()];
+    const quote = TOKEN_BY_SYMBOL[quote_symbol.toUpperCase()];
+    if (!base || !quote) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ok: false,
+                error: "UNKNOWN_TOKEN",
+                message: `Unknown token symbol(s): base=${base_symbol}, quote=${quote_symbol}. Known: ${Object.keys(TOKEN_BY_SYMBOL).join(", ")}.`,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    let fromAxlPubkey: string;
+    try {
+      const t = await axl.topology();
+      fromAxlPubkey = t.ourPublicKey;
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ok: false,
+                error: "AXL_TOPOLOGY_UNREACHABLE",
+                message: (err as Error).message,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const intent = {
+      type: "intent.broadcast" as const,
+      id: uuidv4(),
+      agent_id: user_wallet,
+      from_axl_pubkey: fromAxlPubkey,
+      timestamp: Math.floor(Date.now() / 1000),
+      side,
+      base,
+      quote,
+      amount,
+      max_slippage_bps,
+      privacy: "public" as const,
+      min_counterparty_rep,
+      timeout_ms,
+      // Intent.signature is the user-side outer wrapping sig (SPEC §5.1) —
+      // distinct from the IntentAuthorization sig the agent collects via
+      // /authorize-intent. v1.0 leaves it as a placeholder; the §4.3
+      // privileged-tool checks supersede it for our peer-mesh use.
+      signature: "0x" as Hex,
+    };
+
+    return {
+      content: [
+        { type: "text", text: JSON.stringify({ ok: true, intent }, null, 2) },
+      ],
+    };
+  },
+);
+
 // ---- privileged tools -----------------------------------------------------
 
 server.registerTool(
@@ -245,18 +389,27 @@ server.registerTool(
     },
   },
   async (params) => {
+    const t0 = Date.now();
+    const log = (event: string, extra: Record<string, unknown> = {}) => {
+      process.stderr.write(
+        `[axl-mcp] broadcast_intent ${event} +${Date.now() - t0}ms ${JSON.stringify(extra)}\n`,
+      );
+    };
     try {
+      log("start", { intent_id: params.intent.id });
       // 1 & 4a. Session sig + binding telegram_user_id consistency.
       const sessionWallet = await verifySession(
         { ...params.session_binding, wallet: params.session_binding.wallet as Hex },
         params.session_sig as Hex,
       );
+      log("session_verified", { wallet: sessionWallet });
       // 2. Action sig.
       const actionWallet = await verifyIntentAuthorization(
         params.intent_auth,
         params.intent_auth_sig as Hex,
         params.intent.id,
       );
+      log("auth_verified");
       // 3. Payload schema — already validated by zod above.
       // 4b. Cross-claim binding.
       verifyBinding({
@@ -266,11 +419,16 @@ server.registerTool(
         authTelegramUserId: params.intent_auth.telegram_user_id,
         toolCallTelegramUserId: params.telegram_user_id,
       });
+      log("binding_verified");
       // Side effect: resolve peers via ENS and fan out.
       const body = JSON.stringify(params.intent);
       const sent: Array<{ ens_name: string; axl_pubkey: string }> = [];
       const errors: Array<{ peer: string; err: string }> = [];
       const resolved = await resolveAllPeers();
+      log("peers_resolved", {
+        n: resolved.length,
+        ok: resolved.filter((p) => !p.error).length,
+      });
       for (const peer of resolved) {
         if (peer.error || !peer.axl_pubkey) {
           errors.push({ peer: peer.ens_name, err: peer.error ?? "no_axl_pubkey" });
@@ -278,11 +436,14 @@ server.registerTool(
         }
         try {
           await axl.send(peer.axl_pubkey, body);
+          log("sent_to_peer", { ens: peer.ens_name });
           sent.push({ ens_name: peer.ens_name, axl_pubkey: peer.axl_pubkey });
         } catch (e) {
+          log("send_error", { ens: peer.ens_name, err: (e as Error).message });
           errors.push({ peer: peer.ens_name, err: (e as Error).message });
         }
       }
+      log("done", { sent: sent.length, errors: errors.length });
       return {
         content: [
           {
@@ -363,6 +524,11 @@ server.registerTool(
 
 function rejectAsAuthFailure(err: unknown) {
   if (err instanceof UnauthorizedError) {
+    // Hermes' agent.log truncates the tool body to one line ("failed: ");
+    // mirror to stderr so the real reason lands in mcp-stderr.log.
+    process.stderr.write(
+      `[axl-mcp] privileged tool rejected: ${err.reason} — ${err.message}\n`,
+    );
     return {
       content: [
         {
@@ -374,15 +540,13 @@ function rejectAsAuthFailure(err: unknown) {
     };
   }
   // Non-auth error (network, AXL down, etc.) — surface as a tool-side error.
+  const msg = (err as Error).message ?? String(err);
+  process.stderr.write(`[axl-mcp] tool error: ${msg}\n`);
   return {
     content: [
       {
         type: "text" as const,
-        text: JSON.stringify(
-          { error: "TOOL_ERROR", message: (err as Error).message },
-          null,
-          2,
-        ),
+        text: JSON.stringify({ error: "TOOL_ERROR", message: msg }, null, 2),
       },
     ],
     isError: true,

@@ -40,7 +40,12 @@ export class UnauthorizedError extends Error {
 }
 
 const SESSION_SKEW_SECONDS = 60; // tolerate small clock skew
-const ACTION_SIG_MAX_AGE_SECONDS = 300; // action sigs are short-lived
+// Window between the user signing inside the Mini App and the agent calling
+// the privileged tool. The full round-trip is human-paced — the user has to
+// open the Mini App, read the prompt, switch to their wallet, sign, switch
+// back — plus agent reasoning + tool latency. 15 minutes is a generous cap
+// that still bounds replay safety.
+const ACTION_SIG_MAX_AGE_SECONDS = 900;
 
 /** Verify the session-binding signature, return the bound wallet. Throws
  *  SESSION_INVALID on any failure. */
