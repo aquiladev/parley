@@ -181,25 +181,25 @@ This phase is grounded in `deployment.md`, the working document that tracks depl
  
 **Outcomes:**
  
-- [ ] Three `Dockerfile`s in the repo:
-  - **User Agent image** — Python 3.11+ base for Hermes (installed via `RUN curl | bash`, pinned to a specific Hermes release for reproducibility), plus Node 24 for the MCP servers and AXL sidecar, plus the AXL Go binary copied in. Multi-stage build to keep the final image lean.
-  - **MM Agent image** — Node 24 base with the AXL Go binary and the compiled MM Agent.
-  - **Mini App image** — Node 24 base with `.next/` produced by `next build`. `NEXT_PUBLIC_*` values baked at build time per `deployment.md` §4.
-- [ ] A `compose.yml` that starts all three services with explicit `depends_on` and healthchecks. Order-of-start follows `deployment.md` §7.
-- [ ] A `.env.example` aligned with `deployment.md` §2. The single root-level `.env` is mounted read-only into containers; never `COPY`'d into images. Each service receives only the variables it actually needs.
-- [ ] Volume mounts for the persistent state listed in `deployment.md` §3: each agent's `axl.pem`, the Hermes state dir (`~/.hermes/`), and the Hermes config sync (SOUL.md and skills directory).
-- [ ] Per-service healthchecks: `curl /topology` for AXL nodes; equivalent endpoints for the agents.
-- [ ] Logo asset sync (`pnpm -F @parley/miniapp sync-assets`) wired into the Mini App image's build step. Skipping this ships stale icons; the build catches it.
-- [ ] A single `make deploy-local` (or equivalent) command that, from a fresh checkout with a populated `.env`, brings the stack up with one invocation.
-- [ ] The Hermes packaging decision committed: bake-install at a pinned version. Documented in the User Agent Dockerfile with the version pin called out.
+- [x] Three `Dockerfile`s in the repo (under `infra/`):
+  - **User Agent image** (`infra/Dockerfile.user-agent`) — Python 3.11 slim base + Node 24 + Hermes pinned to v0.11.0 via the upstream `install.sh` (curl | bash). Multi-stage: golang AXL builder + node TS builder + python+node runtime. `supervisord` runs AXL node + AXL sidecar + `hermes gateway run`.
+  - **MM Agent image** (`infra/Dockerfile.mm-agent`) — Node 24 slim base + AXL Go binary + compiled mm-agent. `tini` PID 1 + bash entrypoint runs AXL in background and mm-agent in foreground.
+  - **Mini App image** (`infra/Dockerfile.miniapp`) — Node 24 slim base + `.next/standalone` server bundle. `NEXT_PUBLIC_*` baked via `--build-arg` per `deployment.md` §4.
+- [x] A `compose.yml` that starts all three services with explicit `depends_on: condition: service_healthy` and healthchecks. Order-of-start follows `deployment.md` §7 (mm-agent waits for user-agent).
+- [x] `.env.example` aligned with `deployment.md` §2. The single root-level `.env` is mounted via `env_file:` into each container (never `COPY`'d into images). Per-service `environment:` overrides null out secrets each service shouldn't see (defense in depth).
+- [x] Volume mounts for the persistent state per `deployment.md` §3: each agent's `axl.pem` is bind-mounted from `infra/state/<agent>/axl.pem`; Hermes' `~/.hermes/` is a named volume `parley_hermes_state`; SOUL.md + skills are COPY'd into the image and the entrypoint syncs them into `~/.hermes/` on start.
+- [x] Per-service healthchecks: `wget /topology` against AXL's HTTP API on port 9002 (agents); HTTP GET / for the Mini App.
+- [x] Logo asset sync (`pnpm -F @parley/miniapp sync-assets`) is a required step in `infra/Dockerfile.miniapp`'s builder stage — skipping it ships stale icons; the Dockerfile makes this explicit, not implicit.
+- [x] `make deploy-local` (in the root `Makefile`) generates AXL identities, builds all three images, and brings the stack up with one invocation.
+- [x] Hermes packaging committed: bake-install at v0.11.0 (override via `--build-arg HERMES_VERSION=...`). Documented inline in `infra/Dockerfile.user-agent`.
 
 **Verification before moving to 6b:**
 
-- [ ] All three containers come up healthy on `docker compose up`
-- [ ] A real Telegram message round-trips through to Hermes and back
-- [ ] The Mini App is reachable on `localhost:<port>` and can complete a session-binding signature
-- [ ] A trade settles end-to-end (User Agent → MM Agent → Settlement → 0G Storage write) entirely inside the local Docker stack
-- [ ] Volume restart test: `docker compose down && docker compose up` preserves Hermes session bindings and AXL identities
+- [x] All three containers come up healthy on `docker compose up` — verified locally, all three reach `(healthy)` within ~30s.
+- [ ] A real Telegram message round-trips through to Hermes and back — pending live exercise (needs Mini App tunnel + Telegram setup; not blocking 6a).
+- [x] The Mini App is reachable on `localhost:3000` and serves the connect/sign/swap routes (HTTP 200, all 11 routes prerendered).
+- [ ] A trade settles end-to-end (User Agent → MM Agent → Settlement → 0G Storage write) entirely inside the local Docker stack — pending live exercise; same gate as the Telegram round-trip.
+- [ ] Volume restart test: `docker compose down && docker compose up` preserves Hermes session bindings and AXL identities — easy to verify once the Telegram round-trip lands; volume + bind-mount config is in place to support it.
 **Demoable state (6a):** Parley running locally on a single laptop via `docker compose up`. Same demo as Phase 5, now reproducible on any machine with Docker installed.
  
 ### Phase 6b — Single-VPS deployment (2–3 days)

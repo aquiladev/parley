@@ -1,6 +1,6 @@
 # Parley — Deployment Notes
 
-**Status:** working document. Captures everything we know now about deploying Parley to a server. Updated as Phase 1+ surfaces real runtime details. Translated into concrete `Dockerfile` / `compose.yml` artifacts in Phase 5 — until then this is the source-of-truth checklist.
+**Status:** working document. Captures everything we know about deploying Parley. Phase 6a translated the open items into committed artifacts: three `Dockerfile`s under `infra/`, a `compose.yml` at the repo root, and a `Makefile` with `make deploy-local` as the single bring-up command. This doc remains the rationale layer behind those artifacts.
 
 **Target:** Sepolia + Galileo testnet only. Mainnet is out of scope for v1.0 (spec §11).
 
@@ -21,12 +21,9 @@ There are **eight logical processes**, hosted across three machines (or three Do
 | | `axl-node-mm` | Go binary | This MM's identity on the AXL mesh |
 | Mini App host | `miniapp` | Next.js (Node) | Wallet signing surface, behind HTTPS reverse proxy |
 
-**Container packaging — undecided, document the options:**
+**Container packaging — committed in Phase 6a: one container per host (3 services).**
 
-- **Tightly bundled:** one container per host, with `supervisord` / `pm2` running all processes inside. Simpler ops, but mixed runtimes (Go + Node) and harder to recycle one process without affecting others.
-- **One container per process:** cleaner restarts and resource limits, more compose plumbing. Each AXL node is its own container.
-
-Recommendation: start with **one container per host** (3 containers total in compose), revisit if any process needs independent scaling.
+The `compose.yml` at the repo root runs three services: `user-agent`, `mm-agent`, `miniapp`. Each agent image bundles its own AXL Go binary as a sibling process, supervised by `supervisord` (User Agent) or a small bash entrypoint with `tini` as PID 1 (MM Agent). The Mini App is a single Node process. Mixed Go/Node/Python in a single container is the explicit trade-off — simpler compose plumbing in exchange for shared crash blast-radius. We may split per-process if any one becomes a noisy neighbor, but that's a Phase 7+ concern.
 
 ---
 
@@ -55,7 +52,7 @@ Every variable in `.env.example` mapped to consumers. Empty cell = not needed.
 | `MM_EVM_PRIVATE_KEY` |  | ✓ |  | Sepolia hot wallet. Funded with Sepolia ETH for gas + tokenB inventory. The `addr` text record on `mm-1.parley.eth` resolves to this wallet's address. |
 | `MM_ENS_NAME` |  | ✓ |  | e.g. `mm-1.parley.eth`. Matches what the User Agent has in `KNOWN_MM_ENS_NAMES`. |
 | `MM_SPREAD_BPS` |  | ✓ |  |  |
-| `MM_INVENTORY_USDC`, `MM_INVENTORY_WETH` |  | ✓ |  | Inventory caps; the MM self-mints + approves at boot against TestERC20s. |
+| `MM_MIN_USDC_RESERVE`, `MM_MIN_WETH_RESERVE` |  | ✓ |  | Optional reserves the MM holds aside when sizing offers (human units; default 0). Available inventory itself is read live from chain `balanceOf` per-intent — fund the MM hot wallet externally and quoting follows the chain immediately, no restart needed. The retired `MM_INVENTORY_USDC` / `MM_INVENTORY_WETH` env vars (env-driven caps) are gone. |
 | `MM_OFFER_EXPIRY_MS`, `MM_SETTLEMENT_WINDOW_MS` |  | ✓ |  | Default 120000 / 300000. |
 | `SEPOLIA_USDC_ADDRESS`, `SEPOLIA_WETH_ADDRESS` | ✓ | ✓ |  | TestERC20 addresses (Phase 1 deployments). Swap to canonical Sepolia USDC/WETH if running with non-test users. |
 | `MINIAPP_BASE_URL` | ✓ |  |  | HTTPS URL the bot embeds in `web_app` buttons. Stable hostname required (Telegram refuses non-HTTPS; cached after the first BotFather config). |
@@ -133,7 +130,7 @@ Step 3 (image build):
 
 In dev, the symlink keeps Hermes in sync with edits without restart.
 
-**Hermes packaging note:** Hermes installs system-wide via the upstream `install.sh` (Python project, not vendored as a submodule). For the User Agent container we either (a) bake the install into the image's Dockerfile via `RUN curl | bash`, or (b) use the upstream's `docker-compose.yml` and mount our config + MCP binaries as volumes. Decide in Phase 5 once Hermes' deployment surface is exercised.
+**Hermes packaging — committed in Phase 6a: bake-install at a pinned version.** `infra/Dockerfile.user-agent` runs `curl https://hermes-agent.nousresearch.com/install.sh | bash` with `HERMES_VERSION=0.11.0` pinned via build arg. Bumping is a deliberate Dockerfile edit. The supervisord program calls `hermes gateway run` (NOT `start` — Hermes refuses to fork under PID 1).
 
 **`NEXT_PUBLIC_*` gotcha:** these are inlined into the client JS bundle by webpack at build time. They cannot be changed after `next build` without rebuilding. Concretely:
 
@@ -169,7 +166,8 @@ Things outside the repo that need to match production deployment values. Easy to
 
 - **WalletConnect Cloud (cloud.reown.com):** add the Mini App's production hostname to the project's allowed domains. Required for the WC modal to load wallets in production.
 - **Telegram BotFather:** `/setdomain` (Login Widget) and the `web_app` URL on the bot's menu button must point to the production Mini App URL. The bot token in the env must match the same bot. **Bot avatar:** upload `artifacts/png/avatar-dark-512.png`.
-- **ENS subnames (Sepolia):** `mm-N.parley.eth` are registered via `pnpm phase3:register-mm`. Currently set on `mm-1.parley.eth`: `addr` → `MM_EVM` derived address, `axl_pubkey` → `KNOWN_MM_AXL_PUBKEYS[0]`, `agent_capabilities` → JSON. **`reputation_root` is not set** — Phase 4 sets it after the first trade. **Subname owner is `PARLEY_ROOT`**, not `MM_EVM` — Phase 4 needs to either transfer ownership to the MM (so the MM can update `reputation_root` on its own) or set up resolver-level approval (`Resolver.approve(mm, true)` so the MM can call `setText` without owning the subname). Re-running registration after a key rotation is mandatory.
+- **ENS subnames (Sepolia):** `mm-N.parley.eth` is registered via `pnpm phase3:register-mm`. Sets `addr` → `MM_EVM`, `axl_pubkey` → the AXL ed25519 pubkey, `agent_capabilities` → JSON. Subname ownership transfers to `MM_EVM` so the MM Agent can update its own `reputation_root` (Phase 4) and `axl_pubkey` (self-heal on rotation, see below) without `PARLEY_ROOT` involvement at runtime.
+- **AXL pubkey ↔ ENS auto-sync:** the MM Agent verifies on every boot that the `axl_pubkey` ENS text record matches its locally mounted `axl.pem`. On mismatch (key rotation, fresh container, new operator) it self-heals by signing a single `Resolver.setText` from `MM_EVM`. Controlled by `MM_AUTO_REGISTER_AXL` (default `true`). Set to `false` in production where every chain write should be reviewed — boot will then refuse to start on drift, with an actionable error message pointing at `pnpm phase3:register-mm`. Without this sync, `broadcast_intent` from the User Agent dials a stale Yggdrasil overlay IPv6 derived from the old pubkey and hangs in a 127s gVisor TCP SYN timeout — the Phase 6a footgun this fix closes.
 - **GitHub repo settings:** social preview image → `artifacts/png/app-icon-light-256.png` (or `-dark-256.png`).
 - **Sepolia funding (Phase 5+ — real tokens):** the demo now uses real Sepolia USDC (`0x1c7D…7238`) and WETH (`0xfFf9…6B14`); the legacy TestERC20-based `mUSDC`/`mWETH` are archived. Both the MM hot wallet (`MM_EVM`) and the user persona need:
   - Sepolia ETH for gas — any standard Sepolia faucet (e.g. `sepoliafaucet.com`, `cloud.google.com/application/web3/faucet/ethereum/sepolia`).

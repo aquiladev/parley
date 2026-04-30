@@ -132,31 +132,19 @@ The read code path is `og-mcp.read_mm_reputation` / `read_user_reputation`; the 
 
 ## Running it
 
-The full Phase 2/3 stack is five local processes. **Prereqs:** Node 24+, pnpm 10+, Foundry, Go 1.25+ (for the AXL binary), [Hermes Agent](https://hermes-agent.nousresearch.com/) installed system-wide, Sepolia-funded wallets for the user persona, MM operator, and `parley.eth` parent, `.env` populated from [`.env.example`](.env.example), an HTTPS tunnel for the Mini App (cloudflared/ngrok), and a Telegram bot token. Full operator instructions in [`docs/deployment.md`](docs/deployment.md) and [`ROADMAP.md`](ROADMAP.md).
+**Prereqs:** Docker (with `compose` plugin), a populated `.env` at the repo root (copy from [`.env.example`](.env.example)), Sepolia-funded wallets for the user persona, MM operator, and `parley.eth` parent, an HTTPS tunnel for the Mini App (cloudflared/ngrok) so Telegram can reach it, and a Telegram bot token. Full operator instructions in [`docs/deployment.md`](docs/deployment.md) and [`ROADMAP.md`](ROADMAP.md).
 
 ```bash
-# 1. AXL nodes (hub for User Agent :9002, spoke for MM Agent :9012)
-~/GitHub/axl/node -config /tmp/axl-test/hub/node-config.json   &
-~/GitHub/axl/node -config /tmp/axl-test/spoke/node-config.json &
-
-# 2. MM Agent (long-running)
-AXL_HTTP_URL=http://127.0.0.1:9012 \
-  node --env-file=.env --import=tsx packages/mm-agent/src/index.ts
-
-# 3. AXL listener sidecar (chain-watcher + /recv polling logs)
-pnpm -F @parley/user-agent dev
-
-# 4. Mini App + tunnel (Telegram requires HTTPS)
-pnpm -F @parley/miniapp dev
-cloudflared tunnel --url http://localhost:3000   # → paste URL into MINIAPP_BASE_URL
-
-# 5. Hermes gateway (Telegram bot)
-hermes gateway start
+make deploy-local
 ```
 
-Then send the bot "swap 10 USDC for WETH" and walk through `/connect` → `/authorize-intent` → `/sign` → `/settle` in the Mini App. (Real Sepolia USDC/WETH; fund the user persona at [faucet.circle.com](https://faucet.circle.com) and wrap a little Sepolia ETH into WETH at `0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14`.)
+That single command generates AXL identities (`infra/state/<agent>/axl.pem` — backed up out-of-band for production), builds three images (`parley-user-agent`, `parley-mm-agent`, `parley-miniapp`), and brings the stack up via `docker compose`. Tail logs with `make logs`; tear down with `make down`.
 
-**One-shot scripts** (also useful as health checks): see `pnpm -F @parley/user-agent` for `phase0:zg-compute`, `phase0:zg-storage`, `phase3:register-mm`. The Phase 1 terminal-only demo script (`phase1-trade.ts`) was removed when Phase 2 took over user-side signing.
+Then expose the Mini App over HTTPS (e.g., `cloudflared tunnel --url http://localhost:3000` and paste the URL into `MINIAPP_BASE_URL` + Telegram BotFather's `web_app` URL), send the bot "swap 10 USDC for WETH", and walk through `/connect` → `/authorize-intent` → `/sign` → `/settle` in the Mini App. (Real Sepolia USDC/WETH; fund the user persona at [faucet.circle.com](https://faucet.circle.com) and wrap a little Sepolia ETH into WETH at `0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14`.)
+
+**Image layout** (per [`infra/`](infra/)): the User Agent image bundles Hermes (Python) + the MCP servers + AXL sidecar + AXL Go binary under one `supervisord`. The MM Agent image bundles `mm-agent` + AXL Go binary. The Mini App ships Next.js standalone output. AXL identities are bind-mounted from the host so image rebuilds don't churn ENS `axl_pubkey` records.
+
+**One-shot scripts** (still useful as health checks, run on the host): see `pnpm -F @parley/user-agent` for `phase0:zg-compute`, `phase0:zg-storage`, `phase3:register-mm`.
 
 ## Repository layout
 
@@ -169,6 +157,9 @@ packages/
 └── miniapp/        # Next.js + wagmi Mini App (Telegram + browser)
 artifacts/          # Logo pack (SVG sources, PNG/ICO/manifest derivatives)
 docs/               # Deployment notes
+infra/              # Dockerfiles, supervisord/AXL configs, entrypoint scripts
+compose.yml         # 3-service local stack (user-agent, mm-agent, miniapp)
+Makefile            # `make deploy-local` and friends
 SPEC.md             # Protocol design (source of truth)
 ROADMAP.md          # Phase-by-phase build plan
 CLAUDE.md           # Project-specific guidance for AI assistants
