@@ -36,6 +36,10 @@ mcp_servers:
       # Required by `read_settlement_state` so the agent can poll for
       # MM-side lock + settle state without an event subscription.
       SETTLEMENT_CONTRACT_ADDRESS: "${SETTLEMENT_CONTRACT_ADDRESS}"
+      # Required by `read_wallet_balance` (the /balance command). Same
+      # canonical Sepolia addresses the MM Agent quotes against.
+      SEPOLIA_USDC_ADDRESS: "${SEPOLIA_USDC_ADDRESS}"
+      SEPOLIA_WETH_ADDRESS: "${SEPOLIA_WETH_ADDRESS}"
   parley_axl:
     command: "node"
     args:

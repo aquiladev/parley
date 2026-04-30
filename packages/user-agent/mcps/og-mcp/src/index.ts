@@ -506,6 +506,29 @@ const SETTLEMENT_STATE_NAMES = [
   "Refunded",    // 4 — refund() called after deadline
 ] as const;
 
+// Token registry for /balance — Sepolia testnet only. Addresses come from
+// env so the same .env that the MM Agent reads (live `balanceOf` quoting)
+// stays the source of truth.
+const USDC_ADDRESS = process.env["SEPOLIA_USDC_ADDRESS"] as Hex | undefined;
+const WETH_ADDRESS = process.env["SEPOLIA_WETH_ADDRESS"] as Hex | undefined;
+
+const ERC20_BALANCE_ABI = parseAbi([
+  "function balanceOf(address) view returns (uint256)",
+  "function decimals() view returns (uint8)",
+  "function symbol() view returns (string)",
+]);
+
+function formatUnits(wei: bigint, decimals: number): string {
+  if (decimals === 0) return wei.toString();
+  const neg = wei < 0n;
+  const abs = neg ? -wei : wei;
+  const s = abs.toString().padStart(decimals + 1, "0");
+  const intPart = s.slice(0, -decimals);
+  const fracPart = s.slice(-decimals).replace(/0+$/, "");
+  const out = fracPart.length > 0 ? `${intPart}.${fracPart}` : intPart;
+  return neg ? `-${out}` : out;
+}
+
 server.registerTool(
   "read_settlement_state",
   {
@@ -573,6 +596,104 @@ server.registerTool(
   },
 );
 
+// /balance command surface. Reads native ETH + the two ERC20 tokens Parley
+// trades on Sepolia (USDC, WETH) in one call. Returns both wei (string, for
+// precise comparisons) and human-formatted decimals so the agent can render
+// without doing math.
+server.registerTool(
+  "read_wallet_balance",
+  {
+    description:
+      "Read a wallet's native ETH and ERC20 (USDC, WETH) balances on Sepolia. Use this for the /balance command. Returns { ok: true, wallet, balances: { eth: { wei, formatted }, usdc: { wei, formatted, decimals: 6, address }, weth: { wei, formatted, decimals: 18, address } } }. Cheap (one eth_getBalance + two eth_call). On RPC failure returns { ok: false, error }.",
+    inputSchema: {
+      wallet: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
+    },
+  },
+  async ({ wallet }) => {
+    if (!USDC_ADDRESS || !WETH_ADDRESS) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ok: false,
+                error:
+                  "SEPOLIA_USDC_ADDRESS / SEPOLIA_WETH_ADDRESS not set in og-mcp env (check hermes-config/config.yaml mcp_servers.parley_og.env)",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+    const addr = wallet as Hex;
+    try {
+      const [ethWei, usdcWei, wethWei] = await Promise.all([
+        client.getBalance({ address: addr }),
+        client.readContract({
+          address: USDC_ADDRESS,
+          abi: ERC20_BALANCE_ABI,
+          functionName: "balanceOf",
+          args: [addr],
+        }) as Promise<bigint>,
+        client.readContract({
+          address: WETH_ADDRESS,
+          abi: ERC20_BALANCE_ABI,
+          functionName: "balanceOf",
+          args: [addr],
+        }) as Promise<bigint>,
+      ]);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ok: true,
+                wallet: addr,
+                balances: {
+                  eth: { wei: ethWei.toString(), formatted: formatUnits(ethWei, 18), decimals: 18 },
+                  usdc: {
+                    wei: usdcWei.toString(),
+                    formatted: formatUnits(usdcWei, 6),
+                    decimals: 6,
+                    address: USDC_ADDRESS,
+                  },
+                  weth: {
+                    wei: wethWei.toString(),
+                    formatted: formatUnits(wethWei, 18),
+                    decimals: 18,
+                    address: WETH_ADDRESS,
+                  },
+                },
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { ok: false, wallet: addr, error: (err as Error).message },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
 async function fetchAllSafely(rootHashes: string[]): Promise<TradeRecord[]> {
   const results = await Promise.all(
     rootHashes.map(async (h) => {
@@ -595,5 +716,5 @@ await server.connect(transport);
 process.stderr.write(
   "[og-mcp] connected (resolve_mm, read_mm_reputation, read_user_reputation, " +
     "write_trade_record, read_trade_history, prepare_fallback_swap, " +
-    "get_uniswap_reference_quote, read_settlement_state)\n",
+    "get_uniswap_reference_quote, read_settlement_state, read_wallet_balance)\n",
 );
