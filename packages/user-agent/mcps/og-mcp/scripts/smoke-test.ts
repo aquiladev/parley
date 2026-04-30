@@ -127,6 +127,20 @@ const rq = await client.callTool({
 });
 console.log(JSON.stringify(rq, null, 2));
 
+// Comparison-fields smoke. Peer offers way more WETH than the thin Sepolia
+// pool gives — peer should come out as the better deal.
+const peerBetter = "33266799733865"; // 0.0000333 WETH (3000 USDC/WETH * 0.01)
+console.log("\nget_uniswap_reference_quote with peer offer (peer better):");
+const rqPeer = await client.callTool({
+  name: "get_uniswap_reference_quote",
+  arguments: {
+    intent: { ...fakeIntent, amount: "0.01" },
+    swapper: fakeSwapper,
+    peer_amount_out_wei: peerBetter,
+  },
+});
+console.log(JSON.stringify(rqPeer, null, 2));
+
 console.log("\nprepare_fallback_swap(Sepolia 10 USDC -> WETH):");
 const rs = await client.callTool({
   name: "prepare_fallback_swap",

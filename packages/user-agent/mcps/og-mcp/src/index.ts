@@ -11,10 +11,28 @@
 //   - update_mm_reputation_root: writes the latest index-blob root hash to
 //                                the MM's ENS text record (Phase 4B owner).
 
+// CRITICAL: redirect console.* to stderr BEFORE any other imports.
+// `@0gfoundation/0g-ts-sdk` writes "Starting upload for file of size..." and
+// similar progress lines to stdout via console.log during upload. This MCP
+// uses stdio transport, where stdout is reserved for JSON-RPC messages — any
+// non-JSON output corrupts the protocol stream and Hermes' MCP client throws
+// `pydantic_core.ValidationError: Invalid JSON: expected value at line 1`.
+// The MCP SDK's StdioServerTransport uses `process.stdout.write` directly,
+// not `console.*`, so silencing console doesn't affect protocol output.
+const _redirected = (msg: unknown): void => {
+  const text = typeof msg === "string" ? msg : JSON.stringify(msg);
+  process.stderr.write(`[og-mcp:console] ${text}\n`);
+};
+console.log = (...args: unknown[]): void => _redirected(args.map(String).join(" "));
+console.info = console.log;
+console.warn = console.log;
+console.debug = console.log;
+// console.error → keep going to stderr natively (already harmless).
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { createPublicClient, http, type Hex } from "viem";
+import { createPublicClient, http, parseAbi, type Hex } from "viem";
 import { sepolia } from "viem/chains";
 import { normalize } from "viem/ens";
 import type { TradeRecord } from "@parley/shared";
@@ -410,7 +428,10 @@ server.registerTool(
   "get_uniswap_reference_quote",
   {
     description:
-      "Reference price for `intent` from Uniswap (no calldata-build step). Used during offer evaluation to compute 'saves X% vs Uniswap'. The Trading API v1 requires `swapper` even on quote-only calls — pass the user's session-bound wallet. Optionally pass `peer_amount_out_wei` to get savings_bps in the response. Returns { ok:true, value:{ amountOut, amountOutWei, amountInWei, effectivePrice, route, savings_bps_vs_peer? } } or { ok:false, error }.",
+      "Reference price for `intent` from Uniswap v3 (on-chain QuoterV2; no calldata build). Used during offer evaluation to compute the `vs Uniswap` line on the offer card. Pass `peer_amount_out_wei` (the MM offer's amountB) to get the comparison fields filled in. " +
+      "On success returns `{ ok:true, value:{ amountOut, amountOutWei, amountInWei, effectivePrice, feeTier, route, " +
+      "peer_amount_out_wei?, uniswap_amount_out_wei?, peer_better_than_uniswap?, peer_advantage_bps? } }`. " +
+      "**Sign convention:** `peer_advantage_bps` is signed — POSITIVE means the peer offers MORE output tokens than Uniswap (good for the user; surface as 'saves X% vs Uniswap'); NEGATIVE means the peer offers LESS (bad; surface as 'X% worse than Uniswap'). Always cross-check by comparing `peer_amount_out_wei` directly against `uniswap_amount_out_wei` — peer_better_than_uniswap is precomputed from that comparison so you can trust the boolean even if the bps math feels off.",
     inputSchema: {
       intent: FallbackIntentSchema,
       swapper: z.string(),
@@ -433,9 +454,17 @@ server.registerTool(
       try {
         const peerWei = BigInt(peer_amount_out_wei);
         const uniswapWei = BigInt(result.value.amountOutWei);
-        enriched["savings_bps_vs_peer"] = computeSavingsBps(peerWei, uniswapWei);
+        // Pre-compute multiple redundant signals so the agent has more than
+        // one way to read the comparison. The historic `savings_bps_vs_peer`
+        // name was ambiguous — "vs peer" could mean either direction. The
+        // new `peer_advantage_bps` is unambiguous: POSITIVE = peer is the
+        // better deal for the user.
+        enriched["peer_amount_out_wei"] = peerWei.toString();
+        enriched["uniswap_amount_out_wei"] = uniswapWei.toString();
+        enriched["peer_better_than_uniswap"] = peerWei > uniswapWei;
+        enriched["peer_advantage_bps"] = computeSavingsBps(peerWei, uniswapWei);
       } catch (err) {
-        enriched["savings_bps_error"] = (err as Error).message;
+        enriched["comparison_error"] = (err as Error).message;
       }
     }
     return {
@@ -446,6 +475,101 @@ server.registerTool(
         },
       ],
     };
+  },
+);
+
+// ---- Settlement state polling tool ----------------------------------------
+//
+// The agent can't see chain events itself — Hermes' Telegram adapter has no
+// chain-watcher integration, and the AXL sidecar's chain logs go to stdout
+// for ops, not to Hermes' inbox. So after the user submits `lockUserSide`,
+// the agent has no signal that the MM has counter-locked unless it polls.
+//
+// This tool exposes Settlement.getState(dealHash) so SOUL.md's "Settlement"
+// section can schedule a tight poll between `lock_submitted` and either
+// BothLocked (→ surface /settle) or deadline-elapsed-while-still-UserLocked
+// (→ surface /refund).
+
+const SETTLEMENT_ADDRESS = process.env["SETTLEMENT_CONTRACT_ADDRESS"] as
+  | Hex
+  | undefined;
+
+const SETTLEMENT_GET_STATE_ABI = parseAbi([
+  "function getState(bytes32 dealHash) external view returns (uint8)",
+]);
+
+const SETTLEMENT_STATE_NAMES = [
+  "None",        // 0 — deal hash never seen on-chain
+  "UserLocked",  // 1 — user called lockUserSide
+  "BothLocked",  // 2 — MM has counter-locked; settle() can run
+  "Settled",     // 3 — settle() succeeded; tokens swapped
+  "Refunded",    // 4 — refund() called after deadline
+] as const;
+
+server.registerTool(
+  "read_settlement_state",
+  {
+    description:
+      "Read the on-chain state of a Parley Settlement deal by its deal_hash. Use this AFTER receiving `lock_submitted` from /sign to detect when the MM counter-locks (state moves UserLocked → BothLocked, your cue to send the /settle button), and before sending /refund (state must be UserLocked or BothLocked AND deal.deadline must have passed). Returns { ok: true, state: 'None' | 'UserLocked' | 'BothLocked' | 'Settled' | 'Refunded', state_int: 0..4 } or { ok: false, error }. Recommended polling cadence: every 10s for up to 3× deal.deadline window after lock_submitted; back off to every 30s past deadline. Cheap call (single eth_call); no signature required.",
+    inputSchema: {
+      deal_hash: z.string().regex(/^0x[0-9a-fA-F]{64}$/),
+    },
+  },
+  async ({ deal_hash }) => {
+    if (!SETTLEMENT_ADDRESS) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ok: false,
+                error: "SETTLEMENT_CONTRACT_ADDRESS not set in og-mcp env",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+    try {
+      const stateInt = (await client.readContract({
+        address: SETTLEMENT_ADDRESS,
+        abi: SETTLEMENT_GET_STATE_ABI,
+        functionName: "getState",
+        args: [deal_hash as Hex],
+      })) as number;
+      const state =
+        SETTLEMENT_STATE_NAMES[Number(stateInt)] ?? `Unknown(${stateInt})`;
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { ok: true, deal_hash, state, state_int: Number(stateInt) },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { ok: false, error: (err as Error).message },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
   },
 );
 
@@ -471,5 +595,5 @@ await server.connect(transport);
 process.stderr.write(
   "[og-mcp] connected (resolve_mm, read_mm_reputation, read_user_reputation, " +
     "write_trade_record, read_trade_history, prepare_fallback_swap, " +
-    "get_uniswap_reference_quote)\n",
+    "get_uniswap_reference_quote, read_settlement_state)\n",
 );

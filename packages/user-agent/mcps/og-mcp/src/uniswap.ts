@@ -35,6 +35,30 @@ export interface UniswapIntent {
   max_slippage_bps: number;
 }
 
+/** Intent's base/quote are nominal pair labels — they don't tell us which
+ *  side of the swap is the input. The `side` field does:
+ *
+ *    side === "sell": user gives `base`, receives `quote`. tokenIn=base,
+ *                     tokenOut=quote, amount denominated in base.decimals.
+ *    side === "buy":  user gives `quote`, receives `base`. tokenIn=quote,
+ *                     tokenOut=base, amount denominated in quote.decimals.
+ *
+ *  The MM negotiator follows the same convention (see negotiator.ts
+ *  pairFromIntent + sizeDeal). Without this resolution every Uniswap call
+ *  would be in the wrong direction with the wrong decimals — silently
+ *  returning a number that lines up unit-wise but represents the inverse
+ *  trade. The "saves X% vs Uniswap" comparison then mixes peer-out and
+ *  uniswap-out denominated in different tokens (apples vs oranges). */
+function resolveDirection(intent: UniswapIntent): {
+  tokenIn: UniswapIntent["base"];
+  tokenOut: UniswapIntent["base"];
+} {
+  if (intent.side === "sell") {
+    return { tokenIn: intent.base, tokenOut: intent.quote };
+  }
+  return { tokenIn: intent.quote, tokenOut: intent.base };
+}
+
 // Per-chain Uniswap v3 deployment addresses.
 // Source: developers.uniswap.org/contracts/v3/reference/deployments
 interface ChainDeployment {
@@ -187,26 +211,27 @@ export async function prepareFallbackSwap(
   userAddress: Hex,
 ): Promise<Result<PreparedFallbackSwap>> {
   try {
-    const chainId = intent.quote.chain_id;
+    const { tokenIn, tokenOut } = resolveDirection(intent);
+    const chainId = tokenIn.chain_id;
     const dep = getDeployment(chainId);
     if (!dep.ok) return dep;
     const rpc = getRpcUrl();
     if (!rpc.ok) return rpc;
     const client = buildClient(rpc.value);
 
-    const amountInWei = parseUnits(intent.amount, intent.quote.decimals);
+    const amountInWei = parseUnits(intent.amount, tokenIn.decimals);
 
     const best = await findBestRoute(
       client,
       dep.value.quoterV2,
-      intent.quote.address,
-      intent.base.address,
+      tokenIn.address,
+      tokenOut.address,
       amountInWei,
     );
     if (best === null) {
       return {
         ok: false,
-        error: `no v3 pool found for ${intent.quote.symbol}/${intent.base.symbol} on chain ${chainId}`,
+        error: `no v3 pool found for ${tokenIn.symbol}->${tokenOut.symbol} on chain ${chainId}`,
       };
     }
 
@@ -224,8 +249,8 @@ export async function prepareFallbackSwap(
       functionName: "exactInputSingle",
       args: [
         {
-          tokenIn: intent.quote.address,
-          tokenOut: intent.base.address,
+          tokenIn: tokenIn.address,
+          tokenOut: tokenOut.address,
           fee: best.feeTier,
           recipient: userAddress,
           amountIn: amountInWei,
@@ -240,14 +265,14 @@ export async function prepareFallbackSwap(
       data,
       value: "0",
       approvalRequired: {
-        token: intent.quote.address,
+        token: tokenIn.address,
         spender: dep.value.swapRouter02,
       },
       expectedInput: intent.amount,
-      expectedOutput: formatUnitsDecimal(best.amountOutWei, intent.base.decimals),
-      minOutput: formatUnitsDecimal(amountOutMinimumWei, intent.base.decimals),
+      expectedOutput: formatUnitsDecimal(best.amountOutWei, tokenOut.decimals),
+      minOutput: formatUnitsDecimal(amountOutMinimumWei, tokenOut.decimals),
       feeTier: best.feeTier,
-      route: `v3:${intent.quote.symbol}->${intent.base.symbol} (${formatFeeTier(best.feeTier)})`,
+      route: `v3:${tokenIn.symbol}->${tokenOut.symbol} (${formatFeeTier(best.feeTier)})`,
     };
     return { ok: true, value };
   } catch (err) {
@@ -269,38 +294,39 @@ export async function getUniswapQuote(
   _swapper: Hex,
 ): Promise<Result<UniswapQuoteResult>> {
   try {
-    const chainId = intent.quote.chain_id;
+    const { tokenIn, tokenOut } = resolveDirection(intent);
+    const chainId = tokenIn.chain_id;
     const dep = getDeployment(chainId);
     if (!dep.ok) return dep;
     const rpc = getRpcUrl();
     if (!rpc.ok) return rpc;
     const client = buildClient(rpc.value);
 
-    const amountInWei = parseUnits(intent.amount, intent.quote.decimals);
+    const amountInWei = parseUnits(intent.amount, tokenIn.decimals);
 
     const best = await findBestRoute(
       client,
       dep.value.quoterV2,
-      intent.quote.address,
-      intent.base.address,
+      tokenIn.address,
+      tokenOut.address,
       amountInWei,
     );
     if (best === null) {
       return {
         ok: false,
-        error: `no v3 pool found for ${intent.quote.symbol}/${intent.base.symbol} on chain ${chainId}`,
+        error: `no v3 pool found for ${tokenIn.symbol}->${tokenOut.symbol} on chain ${chainId}`,
       };
     }
 
-    const amountOut = formatUnitsDecimal(best.amountOutWei, intent.base.decimals);
+    const amountOut = formatUnitsDecimal(best.amountOutWei, tokenOut.decimals);
     const effectivePrice =
       best.amountOutWei === 0n
         ? "0"
         : divDecimal(
             best.amountOutWei,
             amountInWei,
-            intent.base.decimals,
-            intent.quote.decimals,
+            tokenOut.decimals,
+            tokenIn.decimals,
           );
 
     return {
@@ -311,7 +337,7 @@ export async function getUniswapQuote(
         amountInWei: amountInWei.toString(),
         effectivePrice,
         feeTier: best.feeTier,
-        route: `v3:${intent.quote.symbol}->${intent.base.symbol} (${formatFeeTier(best.feeTier)})`,
+        route: `v3:${tokenIn.symbol}->${tokenOut.symbol} (${formatFeeTier(best.feeTier)})`,
       },
     };
   } catch (err) {
