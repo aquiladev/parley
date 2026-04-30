@@ -234,7 +234,7 @@ This phase is grounded in `deployment.md`, the working document that tracks depl
  
 - **Does not add CI/CD.** Push-to-deploy is a separate operational maturity step. Phase 6 leaves deploy as a manual `make deploy` invocation triggered from the developer's machine. CI/CD is on the post-Phase-7 backlog.
 - **Does not add metrics dashboards.** Logs to `docker logs` are the floor; an aggregated dashboard is welcome but explicitly out of scope. Phase 6 is "self-hostable," not "production-grade observability."
-- **Does not split User Agent and MM Agent across hosts.** Single VPS, three containers. The split-deployment posture is a future operational concern.
+- **Does not split User Agent and MM Agent across hosts.** Single VPS, all containers (four after Phase 7: user-agent, mm-agent, mm-agent-2, miniapp). The split-deployment posture is a future operational concern.
 - **Does not handle protocol upgrades / rolling restarts.** A `docker compose restart user-agent` will drop in-flight Mini App signing flows. Mitigating that requires session-state persistence beyond what's specced. Out of scope for Phase 6; on the operational-maturity backlog.
 ---
  
@@ -246,22 +246,30 @@ This phase is grounded in `deployment.md`, the working document that tracks depl
 **Goal:** make it visible that Parley is a multi-MM marketplace by running two MMs with distinct configurations and showing competing offers in the Telegram offer card.
  
 **Outcomes:**
- 
-- [ ] A second MM Agent (`mm-2.parley.eth`) registered on Sepolia ENS via the registration script, with distinct `agent_capabilities` from `mm-1` (different max size, different pair set, or both — `deployment.md` §6 covers the registration step).
-- [ ] A second container in `compose.yml` running the same MM Agent code with different config: distinct `MM_EVM_PRIVATE_KEY`, different `MM_SPREAD_BPS`, different inventory targets. This validates that one MM Agent codebase can run as N independent operators with no shared state.
-- [ ] The User Agent's `KNOWN_MM_ENS_NAMES` env var updated to include both subnames; peer discovery resolves both in parallel and fans out intents to each.
-- [ ] The Telegram offer card updated to display competing offers side-by-side rather than a single offer:
-  - Each row shows the MM's ENS name, reputation score, price quoted, and the "vs Uniswap" delta
-  - The User Agent ranks them by composite score (price + reputation, weighted per `/policy`) and indicates the recommended pick
-  - The user picks; the picked offer proceeds through the standard accept/lock/settle flow
-  - The unpicked offer is recorded (not shown to the MM in v1.0; future iterations could feed it back as competitive signal)
+
+- [x] Second MM Agent (`mm-2.parley.eth`) registered on Sepolia ENS via the registration script, distinct from `mm-1` (different `MM_SPREAD_BPS` so the two MMs quote distinguishable prices).
+- [x] Second container `mm-agent-2` in `compose.yml` running the same image with overrides via a YAML anchor (`x-mm-agent-base`). Distinct `MM_EVM_PRIVATE_KEY`, `MM_ENS_NAME`, `MM_SPREAD_BPS`, bind-mounted `infra/state/mm-agent-2/axl.pem`, and a host port (`127.0.0.1:9012`). Inventory comes from on-chain `balanceOf` (Phase 4 change), so each MM tracks its own funded wallet automatically.
+- [x] `KNOWN_MM_ENS_NAMES` extended to include both subnames; existing `axl-mcp.discover_peers` already fans out across all entries in parallel — no code change needed there.
+- [x] Telegram offer card rewritten as a multi-button card via `mcp_parley_tg_send_webapp_buttons` (already shipped in Phase 5; Phase 7 only changed the SOUL.md flow that drives it):
+  - One Telegram message with stacked rows, one per surviving offer (cap at 3 for screen fit)
+  - Each row: MM ENS name, reputation score, output amount, and `peer_advantage_bps` framed as "saves X%" or "⚠ X% worse than Uniswap"
+  - Ranked by output amount descending (most output to the user wins); top row marked ⭐ recommended. Reputation is shown for transparency but `min_counterparty_rep` acts as a floor filter, not a weight.
+  - User picks one; that offer's `offer_id` flows through the standard accept/lock/settle path. Unpicked offers expire MM-side as no Accept ever lands.
+
+**Supplementary fixes shipped during Phase 7** (small, in scope):
+
+- [x] `phase3:register-mm` parameterized: CLI flags (`--mm <n>`, `--ens`, `--key`, `--axl-pem`, `--axl-pubkey`) with auto-derivation of the AXL ed25519 pubkey from the on-disk PEM (last 32 bytes of SPKI DER, verified to match axl-node's `/topology` `our_public_key`). Replaces the awkward `KNOWN_MM_AXL_PUBKEYS` copy-paste path.
+- [x] 0G Storage upload retry on nonce collision. Both `mm-agent` and `mm-agent-2` (and `og-mcp` on the User Agent) sign uploads from a shared `OG_PRIVATE_KEY` — one nonce queue per address. With multi-MM, concurrent publishes hit `REPLACEMENT_UNDERPRICED`. `uploadJsonBlob`/`uploadTradeRecord` now wait+retry (8s/15s/25s backoff) on `REPLACEMENT_UNDERPRICED`/`NONCE_EXPIRED`/equivalent message-substring matches.
+- [x] `/balance` was previously dead. SOUL.md instructed the agent to call `eth_getBalance` and `balanceOf` directly, but no MCP tool exposed raw RPC. Added `mcp_parley_og_read_wallet_balance` (one call returns ETH + USDC + WETH, both wei and pre-formatted with the right decimals) and updated SOUL.md to use it.
 
 **Verification:**
 
-- [ ] Two MM Agents respond to a single intent broadcast within the negotiation timeout
-- [ ] The user sees both offers in one Telegram message, distinguished by ENS name
-- [ ] Picking one MM proceeds to settlement against that MM only; the other MM's offer expires cleanly
-- [ ] Reputation scores accrue independently for both MMs based on their settlement records
+- [x] `docker compose config --services` lists 4 services (`user-agent`, `mm-agent`, `mm-agent-2`, `miniapp`); both MMs reach `(healthy)` and emit independent `axl_identity_in_sync` log lines for their respective ENS names.
+- [x] Two distinct AXL pubkeys: `mm-agent`'s `our_public_key` differs from `mm-agent-2`'s.
+- [x] Both MMs respond to a single intent broadcast within `intent.timeout_ms`; the user sees both offers in one Telegram message distinguished by ENS name.
+- [x] Picking one MM proceeds to settlement against that MM only; the other MM's offer expires MM-side without intervention.
+- [x] Reputation scores accrue independently per MM via 0G TradeRecords keyed by ENS name; `read_mm_reputation` returns separate histories.
+
 **Demoable state:** the protocol's multi-MM premise is now visible in the demo. The user-facing pitch beat — "two market makers competed for your trade, your agent picked the better one" — is anchored in the actual UI rather than implied by the architecture diagram.
  
 ---

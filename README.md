@@ -22,7 +22,7 @@ A user broadcasts an intent over [Gensyn AXL](https://github.com/gensyn-ai/axl);
 - **User Agent** — [Hermes Agent](https://nousresearch.com/) (LLM-driven; **Claude API** as primary in Phase 2, 0G Compute deferred to Phase 4 pending a broker proxy) + custom MCP servers (`axl-mcp`, `og-mcp`) + AXL sidecar. Source: `packages/user-agent/`.
 - **MM Agent** — deterministic TypeScript daemon, *no LLM in the pricing path*. Source: `packages/mm-agent/`.
 - **Mini App** — Next.js + WalletConnect + injected (MetaMask/Rabby/Coinbase), runs inside Telegram or any browser. The only place a user's wallet ever signs. Source: `packages/miniapp/`.
-- **Identity** — MMs as ENS subnames under `parley.eth` on Sepolia ([`mm-1.parley.eth`](https://sepolia.app.ens.domains/mm-1.parley.eth) is live with `addr` + `axl_pubkey` + `agent_capabilities` text records); users by wallet address.
+- **Identity** — MMs as ENS subnames under `parley.eth` on Sepolia ([`mm-1.parley.eth`](https://sepolia.app.ens.domains/mm-1.parley.eth) and [`mm-2.parley.eth`](https://sepolia.app.ens.domains/mm-2.parley.eth) are live with `addr` + `axl_pubkey` + `agent_capabilities` text records, and quote competing offers in the demo); users by wallet address.
 - **Reputation** — both MMs and users have on-chain-anchored reputation scores. See [Reputation](#reputation) below.
 - **Fallback** — direct Uniswap v3 (QuoterV2 + SwapRouter02 on Sepolia) when no peer offer arrives; the same on-chain quoter anchors the "vs Uniswap" delta shown on every peer offer.
 
@@ -127,8 +127,9 @@ The read code path is `og-mcp.read_mm_reputation` / `read_user_reputation`; the 
 | 3 | ENS identity layer — `mm-1.parley.eth` live on Sepolia | ✅ done |
 | 4 | Reputation, refunds, observability | ✅ done |
 | 5 | Uniswap fallback + polish | ✅ done |
-| 6 | Containerized deployment (local Docker → single VPS) | 🚧 next |
-| 7 | Second MM Agent + competitive offer cards | ⏭ planned |
+| 6a | Containerized deployment (local Docker stack) | ✅ done |
+| 6b | Single-VPS deployment | ⏭ planned |
+| 7 | Second MM Agent + competitive offer cards | ✅ done |
 
 ## Running it
 
@@ -158,7 +159,7 @@ packages/
 artifacts/          # Logo pack (SVG sources, PNG/ICO/manifest derivatives)
 docs/               # Deployment notes
 infra/              # Dockerfiles, supervisord/AXL configs, entrypoint scripts
-compose.yml         # 3-service local stack (user-agent, mm-agent, miniapp)
+compose.yml         # 4-service local stack (user-agent, mm-agent, mm-agent-2, miniapp)
 Makefile            # `make deploy-local` and friends
 SPEC.md             # Protocol design (source of truth)
 ROADMAP.md          # Phase-by-phase build plan
