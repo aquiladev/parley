@@ -142,7 +142,13 @@ async function main(): Promise<void> {
   });
 
   void watchChainPolling();
-  void pollAxlForever(axl);
+  // NOTE: AXL's /recv is destructive — every message can be drained exactly
+  // once. The agent (via mcp_parley_axl_poll_inbox) is the consumer in the
+  // live demo flow, so we deliberately do NOT poll /recv from the sidecar
+  // anymore. Re-enabling pollAxlForever empties the queue before the agent
+  // sees it and turns the agent's polling loop into a no-op.
+  // void pollAxlForever(axl);
+  void axl; // silence unused-var
 }
 
 main().catch((err) => {
