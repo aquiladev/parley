@@ -1,0 +1,100 @@
+# Hermes Agent config — the User Agent's runtime knobs.
+#
+# This file replaces ~/.hermes/config.yaml inside the User Agent container at
+# entrypoint time (see infra/entrypoints/user-agent.sh). Anything not set here
+# falls back to Hermes' install defaults; we only override what Parley needs.
+#
+# Auth: pairing is disabled via GATEWAY_ALLOW_ALL_USERS=true in .env. The
+# real user-side authorization happens at our privileged MCP layer (SPEC §4.3).
+# See ROADMAP.md Phase 6b for the production-mode reversal.
+
+model:
+  default: claude-haiku-4-5-20251001
+  provider: anthropic
+
+providers:
+  anthropic:
+    api_key_env: ANTHROPIC_API_KEY
+
+# Parley MCP servers. Paths are container-absolute (set by the Dockerfile's
+# COPY layout); the host's ~/.hermes/config.yaml uses /Users/aquila/... paths
+# and is irrelevant inside the container.
+mcp_servers:
+  parley_og:
+    command: "node"
+    args:
+      - "/opt/parley/packages/user-agent/mcps/og-mcp/dist/index.js"
+    # Hermes' MCP spawner doesn't pass parent env to children, so list every
+    # var og-mcp reads at module load or inside tool handlers. Values are
+    # interpolated from the User Agent container's env (compose.yml's env_file).
+    env:
+      SEPOLIA_RPC_URL: "${SEPOLIA_RPC_URL}"
+      ZG_STORAGE_RPC_URL: "${ZG_STORAGE_RPC_URL}"
+      ZG_STORAGE_INDEXER_URL: "${ZG_STORAGE_INDEXER_URL}"
+      OG_PRIVATE_KEY: "${OG_PRIVATE_KEY}"
+      KNOWN_MM_ENS_NAMES: "${KNOWN_MM_ENS_NAMES}"
+      # Required by `read_settlement_state` so the agent can poll for
+      # MM-side lock + settle state without an event subscription.
+      SETTLEMENT_CONTRACT_ADDRESS: "${SETTLEMENT_CONTRACT_ADDRESS}"
+  parley_axl:
+    command: "node"
+    args:
+      - "/opt/parley/packages/user-agent/mcps/axl-mcp/dist/index.js"
+    env:
+      USER_AXL_HTTP_URL: "http://127.0.0.1:9002"
+      AXL_HTTP_URL: "http://127.0.0.1:9002"
+      KNOWN_MM_ENS_NAMES: "${KNOWN_MM_ENS_NAMES}"
+      SEPOLIA_RPC_URL: "${SEPOLIA_RPC_URL}"
+      # Pass the same token addresses the MM Agent uses, so build_intent
+      # produces an Intent the MM will accept. Without this, axl-mcp falls
+      # back to the canonical real-Sepolia USDC/WETH addresses while the
+      # MM still quotes against the local .env tokens, and every offer
+      # is dropped with `unsupported_pair_or_inventory`.
+      SEPOLIA_USDC_ADDRESS: "${SEPOLIA_USDC_ADDRESS}"
+      SEPOLIA_WETH_ADDRESS: "${SEPOLIA_WETH_ADDRESS}"
+  # Telegram Mini App buttons. Hermes' default Telegram adapter doesn't
+  # render web_app inline buttons; this MCP fills the gap by calling the
+  # Bot API directly. SOUL.md uses this for every /connect /sign /settle
+  # /refund /swap surface.
+  parley_tg:
+    command: "node"
+    args:
+      - "/opt/parley/packages/user-agent/mcps/tg-mcp/dist/index.js"
+    env:
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
+
+agent:
+  inherit_mcp_toolsets: true
+  # SECURITY-CRITICAL: disable Hermes' built-in `memory` toolset.
+  #
+  # Hermes' memory tool writes to a SINGLE global ~/.hermes/memories/MEMORY.md
+  # shared across ALL Telegram users on the same gateway. Without this
+  # disabled the agent stores `parley.session_binding` (wallet address +
+  # signed payload + telegram_user_id) in that file, and the next user to
+  # DM the bot sees the previous user's wallet referenced by name. We've
+  # observed this in production — a fresh Telegram account was greeted with
+  # another user's wallet address. Per-user state lives in Hermes' session
+  # storage (~/.hermes/sessions/), which IS keyed by chat_id; that's the
+  # right place. Memory is for cross-conversation persistent notes, which
+  # Parley genuinely doesn't need (session_binding is short-lived 24h, and
+  # the user re-signs with /connect anyway).
+  #
+  # Other disabled toolsets are general-purpose Hermes capabilities the
+  # Parley agent has no business with — terminal access, file I/O, web
+  # browsing, code execution, etc. Reduces the agent's attack surface and
+  # keeps it focused on the MCP tools we ship.
+  disabled_toolsets:
+    - memory
+    - todo
+    - session_search
+    - web
+    - terminal
+    - file_ops
+    - browser
+    - image_gen
+    - vision
+    - tts
+    - code_execution
+    - delegation
+    - cronjob
+    - skills
