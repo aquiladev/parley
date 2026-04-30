@@ -1,0 +1,84 @@
+/* Theme-aware base styles for the Mini App.
+ *
+ * Inside Telegram, the WebApp SDK injects CSS variables on the document body
+ * (`--tg-theme-bg-color`, `--tg-theme-text-color`, …). We adopt those so the
+ * Mini App matches whichever theme the user has set in their Telegram client.
+ *
+ * Outside Telegram (regular browser tab), those variables are undefined; the
+ * `prefers-color-scheme` media query handles light/dark fallback.
+ *
+ * Reference: https://core.telegram.org/bots/webapps#themeparams
+ */
+
+:root {
+  /* Light fallbacks — used when the variable below isn't set. */
+  --parley-bg:           var(--tg-theme-bg-color, #ffffff);
+  --parley-fg:           var(--tg-theme-text-color, #0f0f12);
+  --parley-hint:         var(--tg-theme-hint-color, rgba(15, 15, 18, 0.6));
+  --parley-link:         var(--tg-theme-link-color, #0066ff);
+  --parley-btn-bg:       var(--tg-theme-button-color, #0066ff);
+  --parley-btn-fg:       var(--tg-theme-button-text-color, #ffffff);
+  --parley-secondary-bg: var(--tg-theme-secondary-bg-color, rgba(0, 0, 0, 0.04));
+  --parley-divider:      var(--tg-theme-section-separator-color, rgba(15, 15, 18, 0.12));
+  --parley-error:        #e0405f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Out-of-Telegram dark mode (e.g. Safari with system dark theme). The
+     * tg-theme-* fallbacks pick up Telegram's own dark palette when running
+     * inside the app — these only fire when those vars are absent. */
+    --parley-bg:           var(--tg-theme-bg-color, #17212b);
+    --parley-fg:           var(--tg-theme-text-color, #f4f4f6);
+    --parley-hint:         var(--tg-theme-hint-color, rgba(244, 244, 246, 0.6));
+    --parley-link:         var(--tg-theme-link-color, #8cb4ff);
+    --parley-btn-bg:       var(--tg-theme-button-color, #4a8fff);
+    --parley-btn-fg:       var(--tg-theme-button-text-color, #ffffff);
+    --parley-secondary-bg: var(--tg-theme-secondary-bg-color, rgba(255, 255, 255, 0.06));
+    --parley-divider:      var(--tg-theme-section-separator-color, rgba(255, 255, 255, 0.12));
+    --parley-error:        #ff7088;
+  }
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--parley-bg);
+  color: var(--parley-fg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Anchor links inside Mini App pages (etherscan tx links etc.). */
+a {
+  color: var(--parley-link);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* Inline styles in our pages (`style={{ background: "#0066ff" }}`) used to
+ * hardcode brand blue; switch them to the theme-aware variable so they match
+ * Telegram's accent color. The route components keep their inline styles for
+ * everything else; only colors get pulled out via these helper classes. */
+.parley-btn {
+  background: var(--parley-btn-bg);
+  color: var(--parley-btn-fg);
+}
+.parley-card-bg {
+  background: var(--parley-secondary-bg);
+}
+.parley-hint {
+  color: var(--parley-hint);
+}
+.parley-err {
+  color: var(--parley-error);
+}
+
+/* Code spans inside the offer card need a different background than body so
+ * deal hashes etc. don't smear into the surrounding text. */
+code {
+  background: var(--parley-secondary-bg);
+  padding: 0 4px;
+  border-radius: 4px;
+  font-size: 0.9em;
+}

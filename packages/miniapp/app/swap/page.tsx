@@ -28,6 +28,10 @@ import { sendResult } from "../../lib/telegram";
 import { SEPOLIA_CHAIN_ID } from "../../lib/walletconnect";
 import { MiniAppHeader } from "../../lib/header";
 import { formatTxError } from "../../lib/tx-error";
+import {
+  estimateContractOverrides,
+  estimateSendOverrides,
+} from "../../lib/gas-estimator";
 
 const ERC20_ABI = parseAbi([
   "function approve(address spender, uint256 amount) returns (bool)",
@@ -47,8 +51,9 @@ function SwapInner() {
   const expectedInput = params.get("expected_input");
   const expectedOutput = params.get("expected_output");
   const pair = params.get("pair");
+  const expectedWallet = params.get("wallet") as Hex | null;
 
-  const { isConnected, chainId } = useAccount();
+  const { address, isConnected, chainId } = useAccount();
   const { connect, connectors, isPending: connecting } = useConnect();
   const { writeContractAsync } = useWriteContract();
   const { sendTransactionAsync } = useSendTransaction();
@@ -102,11 +107,22 @@ function SwapInner() {
 
       if (needsApproval && approvalToken && approvalSpender) {
         setStep("approving");
+        // Pre-fill gas params (see lib/gas-estimator.ts).
+        const approveOverrides = publicClient && address
+          ? await estimateContractOverrides(publicClient, {
+              address: approvalToken,
+              abi: ERC20_ABI,
+              functionName: "approve",
+              args: [approvalSpender, MAX_UINT256],
+              account: address,
+            })
+          : undefined;
         const aHash = await writeContractAsync({
           address: approvalToken,
           abi: ERC20_ABI,
           functionName: "approve",
           args: [approvalSpender, MAX_UINT256],
+          ...(approveOverrides ?? {}),
         });
         setApprovalTx(aHash);
         if (publicClient) {
@@ -118,10 +134,22 @@ function SwapInner() {
       }
 
       setStep("swapping");
+      // Pre-fill gas params for the raw sendTransaction. estimateGas may
+      // revert here if the calldata wouldn't succeed (e.g., approval not
+      // settled yet, slippage breached) — that's a useful pre-flight.
+      const swapOverrides = publicClient && address
+        ? await estimateSendOverrides(publicClient, {
+            account: address,
+            to,
+            data,
+            value,
+          })
+        : undefined;
       const sHash = await sendTransactionAsync({
         to,
         data,
         value,
+        ...(swapOverrides ?? {}),
       });
       setSwapTx(sHash);
       setStep("confirming");
@@ -143,8 +171,10 @@ function SwapInner() {
     return (
       <Page>
         <h1>Uniswap fallback swap</h1>
-        <p style={{ opacity: 0.7 }}>
-          Connect your wallet to fall back to Uniswap.
+        <p style={{ color: "var(--parley-hint)" }}>
+          {expectedWallet
+            ? <>Connect wallet <code>{shortAddr(expectedWallet)}</code> to fall back to Uniswap.</>
+            : "Connect your wallet to fall back to Uniswap."}
         </p>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {connectors.map((c) => (
@@ -162,10 +192,19 @@ function SwapInner() {
     );
   }
 
+  // Soft warning. /swap calldata's `recipient` is set when the agent built it
+  // (typically the bound wallet). Submitting from a different wallet means
+  // YOU pay gas but the tokens may end up at the agent-baked recipient, not
+  // your current wallet — depends on the calldata. Tell the user.
+  const walletMismatch =
+    expectedWallet &&
+    address &&
+    expectedWallet.toLowerCase() !== address.toLowerCase();
+
   return (
     <Page>
       <h1>Uniswap fallback swap</h1>
-      <p style={{ fontSize: 13, opacity: 0.7, lineHeight: 1.5 }}>
+      <p style={{ fontSize: 13, color: "var(--parley-hint)", lineHeight: 1.5 }}>
         No peer offer matched in time. Submit this swap on Uniswap from your
         own wallet — same tokens, current Uniswap rate. You pay gas.
       </p>
@@ -175,7 +214,7 @@ function SwapInner() {
           style={{
             margin: "12px 0",
             padding: "10px 12px",
-            background: "rgba(0,0,0,0.04)",
+            background: "var(--parley-secondary-bg)",
             borderRadius: 8,
             fontSize: 14,
           }}
@@ -189,8 +228,18 @@ function SwapInner() {
         </div>
       )}
 
+      {walletMismatch && (
+        <div style={softNotice}>
+          <b>Heads up:</b> the bot built this swap for{" "}
+          <code>{shortAddr(expectedWallet!)}</code>; you've connected{" "}
+          <code>{shortAddr(address!)}</code>. You can still submit, but the
+          calldata may route the output back to the original wallet — verify
+          the wallet's transaction prompt before signing.
+        </div>
+      )}
+
       {needsApproval && (
-        <p style={{ fontSize: 13, opacity: 0.7 }}>
+        <p style={{ fontSize: 13, color: "var(--parley-hint)" }}>
           A Permit2 approval is required first. Two transactions total.
         </p>
       )}
@@ -270,13 +319,26 @@ function short(s: string): string {
   return s.length > 14 ? `${s.slice(0, 8)}…${s.slice(-6)}` : s;
 }
 
+function shortAddr(a: string): string {
+  return `${a.slice(0, 6)}…${a.slice(-4)}`;
+}
+
+const softNotice: React.CSSProperties = {
+  background: "var(--parley-secondary-bg)",
+  borderRadius: 8,
+  padding: "10px 12px",
+  margin: "12px 0",
+  fontSize: 13,
+  lineHeight: 1.5,
+};
+
 const btn: React.CSSProperties = {
+  background: "var(--parley-btn-bg)",
+  color: "var(--parley-btn-fg)",
   padding: "12px 20px",
   fontSize: 16,
   borderRadius: 8,
   border: "none",
-  background: "#0066ff",
-  color: "white",
   cursor: "pointer",
 };
 
@@ -293,7 +355,7 @@ function Page({ children }: { children: React.ReactNode }) {
 
 function ErrLine({ children }: { children: React.ReactNode }) {
   return (
-    <p style={{ color: "crimson", marginTop: 12, wordBreak: "break-word" }}>
+    <p style={{ color: "var(--parley-error)", marginTop: 12, wordBreak: "break-word" }}>
       {children}
     </p>
   );

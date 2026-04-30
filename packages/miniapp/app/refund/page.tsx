@@ -21,6 +21,7 @@ import { sendResult } from "../../lib/telegram";
 import { SEPOLIA_CHAIN_ID } from "../../lib/walletconnect";
 import { MiniAppHeader } from "../../lib/header";
 import { formatTxError } from "../../lib/tx-error";
+import { estimateContractOverrides } from "../../lib/gas-estimator";
 
 const SETTLEMENT_ADDRESS = (process.env["NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS"] ??
   "0x0000000000000000000000000000000000000000") as Hex;
@@ -34,8 +35,9 @@ type Step = "idle" | "submitting" | "confirming" | "done";
 function RefundInner() {
   const params = useSearchParams();
   const dealHash = params.get("deal_hash") as Hex | null;
+  const expectedWallet = params.get("wallet") as Hex | null;
 
-  const { isConnected, chainId } = useAccount();
+  const { address, isConnected, chainId } = useAccount();
   const { connect, connectors, isPending: connecting } = useConnect();
   const { writeContractAsync } = useWriteContract();
   const { switchChainAsync } = useSwitchChain();
@@ -64,11 +66,22 @@ function RefundInner() {
         await switchChainAsync({ chainId: SEPOLIA_CHAIN_ID });
       }
       setStep("submitting");
+      // Pre-fill gas params (see lib/gas-estimator.ts).
+      const overrides = publicClient && address
+        ? await estimateContractOverrides(publicClient, {
+            address: SETTLEMENT_ADDRESS,
+            abi: SETTLEMENT_ABI,
+            functionName: "refund",
+            args: [dealHash],
+            account: address,
+          })
+        : undefined;
       const tx = await writeContractAsync({
         address: SETTLEMENT_ADDRESS,
         abi: SETTLEMENT_ABI,
         functionName: "refund",
         args: [dealHash],
+        ...(overrides ?? {}),
       });
       setTxHash(tx);
       setStep("confirming");
@@ -87,7 +100,11 @@ function RefundInner() {
     return (
       <Page>
         <h1>Refund</h1>
-        <p style={{ opacity: 0.7 }}>Connect your wallet to refund.</p>
+        <p style={{ color: "var(--parley-hint)" }}>
+          {expectedWallet
+            ? <>Connect wallet <code>{shortAddr(expectedWallet)}</code> to refund.</>
+            : "Connect your wallet to refund."}
+        </p>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {connectors.map((c) => (
             <button
@@ -104,15 +121,31 @@ function RefundInner() {
     );
   }
 
+  // Soft warning, no block — refund() is permissionless. The original locker
+  // gets their tokens back regardless of which wallet calls refund.
+  const walletMismatch =
+    expectedWallet &&
+    address &&
+    expectedWallet.toLowerCase() !== address.toLowerCase();
+
   return (
     <Page>
       <h1>Refund stuck trade</h1>
       <p style={{ wordBreak: "break-all" }}>Deal: <code>{dealHash}</code></p>
-      <p style={{ fontSize: 13, opacity: 0.7 }}>
+      <p style={{ fontSize: 13, color: "var(--parley-hint)" }}>
         The deadline has passed and at least one side never locked. Tap below to
         recover your tokens. The contract reverts (cleanly) if the deadline
         hasn't actually passed yet — re-try later in that case.
       </p>
+      {walletMismatch && (
+        <div style={softNotice}>
+          <b>Heads up:</b> tokens are locked under{" "}
+          <code>{shortAddr(expectedWallet!)}</code>; you've connected{" "}
+          <code>{shortAddr(address!)}</code>. You can still submit — refund is
+          permissionless — but the recovered tokens go to the original wallet,
+          not this one.
+        </div>
+      )}
       <button onClick={submit} disabled={step !== "idle"} style={btn}>
         {step === "submitting"
           ? "Submitting…"
@@ -161,13 +194,26 @@ function short(s: string): string {
   return s.length > 14 ? `${s.slice(0, 8)}…${s.slice(-6)}` : s;
 }
 
+function shortAddr(a: string): string {
+  return `${a.slice(0, 6)}…${a.slice(-4)}`;
+}
+
+const softNotice: React.CSSProperties = {
+  background: "var(--parley-secondary-bg)",
+  borderRadius: 8,
+  padding: "10px 12px",
+  margin: "12px 0",
+  fontSize: 13,
+  lineHeight: 1.5,
+};
+
 const btn: React.CSSProperties = {
+  background: "var(--parley-btn-bg)",
+  color: "var(--parley-btn-fg)",
   padding: "12px 20px",
   fontSize: 16,
   borderRadius: 8,
   border: "none",
-  background: "#0066ff",
-  color: "white",
   cursor: "pointer",
 };
 
@@ -181,5 +227,5 @@ function Page({ children }: { children: React.ReactNode }) {
 }
 
 function ErrLine({ children }: { children: React.ReactNode }) {
-  return <p style={{ color: "crimson", marginTop: 12, wordBreak: "break-word" }}>{children}</p>;
+  return <p style={{ color: "var(--parley-error)", marginTop: 12, wordBreak: "break-word" }}>{children}</p>;
 }

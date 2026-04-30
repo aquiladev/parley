@@ -1,6 +1,8 @@
 import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
 import { ProvidersClient } from "./providers-client";
+import { TelegramReady } from "../lib/telegram-ready";
+import "./globals.css";
 
 // Logo / favicon / OG metadata. Source of truth is /artifacts/ at the repo
 // root; assets are mirrored into /public/{favicon,social}/ via the
@@ -59,6 +61,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         <script src="https://telegram.org/js/telegram-web-app.js" async />
       </head>
       <body>
+        <TelegramReady />
         <ProvidersClient>{children}</ProvidersClient>
       </body>
     </html>

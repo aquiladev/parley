@@ -39,6 +39,10 @@ if (existsSync(repoEnv)) {
 const nextConfig = {
   reactStrictMode: true,
   transpilePackages: ["@parley/shared"],
+  // Emit a self-contained server bundle for Docker deployment (Phase 6).
+  // `.next/standalone/` ships the minimal node_modules subset Next picks
+  // up at runtime — much smaller image than copying the full deps tree.
+  output: "standalone",
 };
 
 export default nextConfig;

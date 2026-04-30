@@ -74,7 +74,7 @@ function ConnectInner() {
     return (
       <Page>
         <h1>Connect wallet</h1>
-        <p style={{ color: "crimson" }}>
+        <p style={{ color: "var(--parley-error)" }}>
           No <code>tid</code> param. Open this page from the Parley bot.
         </p>
       </Page>
@@ -94,7 +94,7 @@ function ConnectInner() {
     return (
       <Page>
         <h1>Connect wallet</h1>
-        <p style={{ opacity: 0.7 }}>For Telegram user <code>{tid}</code></p>
+        <p style={{ color: "var(--parley-hint)" }}>For Telegram user <code>{tid}</code></p>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {connectors.map((c) => (
             <button
@@ -124,7 +124,7 @@ function ConnectInner() {
       <p style={{ wordBreak: "break-all" }}>Wallet: {address}</p>
       <p>Chain: {chainId}</p>
       <p>Telegram user: {tid}</p>
-      <p style={{ opacity: 0.7, fontSize: 13 }}>
+      <p style={{ color: "var(--parley-hint)", fontSize: 13 }}>
         This signature binds your wallet to your Telegram session for 24 hours. It
         is not a transaction; nothing is sent on-chain.
       </p>
@@ -133,7 +133,7 @@ function ConnectInner() {
       </button>
       <button
         onClick={() => disconnect()}
-        style={{ ...btn, marginLeft: 12, background: "#eee", color: "#333" }}
+        style={{ ...btn, marginLeft: 12, background: "var(--parley-secondary-bg)", color: "var(--parley-fg)" }}
       >
         Disconnect
       </button>
@@ -169,12 +169,12 @@ function connectorLabel(c: ConnectorLike): string {
 // ---- styling helpers ------------------------------------------------------
 
 const btn: React.CSSProperties = {
+  background: "var(--parley-btn-bg)",
+  color: "var(--parley-btn-fg)",
   padding: "12px 20px",
   fontSize: 16,
   borderRadius: 8,
   border: "none",
-  background: "#0066ff",
-  color: "white",
   cursor: "pointer",
 };
 
@@ -188,5 +188,5 @@ function Page({ children }: { children: React.ReactNode }) {
 }
 
 function ErrLine({ children }: { children: React.ReactNode }) {
-  return <p style={{ color: "crimson", marginTop: 12 }}>{children}</p>;
+  return <p style={{ color: "var(--parley-error)", marginTop: 12 }}>{children}</p>;
 }

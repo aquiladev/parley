@@ -23,6 +23,7 @@ import { sendResult } from "../../lib/telegram";
 import { SEPOLIA_CHAIN_ID } from "../../lib/walletconnect";
 import { MiniAppHeader } from "../../lib/header";
 import { formatTxError } from "../../lib/tx-error";
+import { estimateContractOverrides } from "../../lib/gas-estimator";
 
 const SETTLEMENT_ADDRESS = (process.env["NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS"] ??
   "0x0000000000000000000000000000000000000000") as Hex;
@@ -36,8 +37,9 @@ type Step = "idle" | "submitting" | "confirming" | "done";
 function SettleInner() {
   const params = useSearchParams();
   const dealHash = params.get("deal_hash") as Hex | null;
+  const expectedWallet = params.get("wallet") as Hex | null;
 
-  const { isConnected, chainId } = useAccount();
+  const { address, isConnected, chainId } = useAccount();
   const { connect, connectors, isPending: connecting } = useConnect();
   const { writeContractAsync } = useWriteContract();
   const { switchChainAsync } = useSwitchChain();
@@ -66,11 +68,23 @@ function SettleInner() {
         await switchChainAsync({ chainId: SEPOLIA_CHAIN_ID });
       }
       setStep("submitting");
+      // Pre-fill gas params (see lib/gas-estimator.ts) so MetaMask Mobile
+      // shows a real Sepolia number instead of an aggressive default.
+      const overrides = publicClient && address
+        ? await estimateContractOverrides(publicClient, {
+            address: SETTLEMENT_ADDRESS,
+            abi: SETTLEMENT_ABI,
+            functionName: "settle",
+            args: [dealHash],
+            account: address,
+          })
+        : undefined;
       const tx = await writeContractAsync({
         address: SETTLEMENT_ADDRESS,
         abi: SETTLEMENT_ABI,
         functionName: "settle",
         args: [dealHash],
+        ...(overrides ?? {}),
       });
       setTxHash(tx);
       setStep("confirming");
@@ -89,7 +103,11 @@ function SettleInner() {
     return (
       <Page>
         <h1>Settle</h1>
-        <p style={{ opacity: 0.7 }}>Connect your wallet to settle.</p>
+        <p style={{ color: "var(--parley-hint)" }}>
+          {expectedWallet
+            ? <>Connect wallet <code>{shortAddr(expectedWallet)}</code> to settle.</>
+            : "Connect your wallet to settle."}
+        </p>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {connectors.map((c) => (
             <button
@@ -106,13 +124,30 @@ function SettleInner() {
     );
   }
 
+  // Soft mismatch warning. settle() is permissionless on-chain — anyone can
+  // submit. We don't block, but we tell the user so they don't pay gas
+  // thinking they're settling from the wrong account by mistake.
+  const walletMismatch =
+    expectedWallet &&
+    address &&
+    expectedWallet.toLowerCase() !== address.toLowerCase();
+
   return (
     <Page>
       <h1>Settle trade</h1>
       <p style={{ wordBreak: "break-all" }}>Deal: <code>{dealHash}</code></p>
-      <p style={{ fontSize: 13, opacity: 0.7 }}>
+      <p style={{ fontSize: 13, color: "var(--parley-hint)" }}>
         Both sides have locked their tokens. Tap below to release the swap atomically. You pay gas.
       </p>
+      {walletMismatch && (
+        <div style={softNotice}>
+          <b>Heads up:</b> tokens are locked under{" "}
+          <code>{shortAddr(expectedWallet!)}</code>; you've connected{" "}
+          <code>{shortAddr(address!)}</code>. You can still submit — settle is
+          permissionless — but the swap will land in the original wallet, not
+          this one.
+        </div>
+      )}
       <button onClick={submit} disabled={step !== "idle"} style={btn}>
         {step === "submitting"
           ? "Submitting…"
@@ -161,14 +196,27 @@ function short(s: string): string {
   return s.length > 14 ? `${s.slice(0, 8)}…${s.slice(-6)}` : s;
 }
 
+function shortAddr(a: string): string {
+  return `${a.slice(0, 6)}…${a.slice(-4)}`;
+}
+
 const btn: React.CSSProperties = {
+  background: "var(--parley-btn-bg)",
+  color: "var(--parley-btn-fg)",
   padding: "12px 20px",
   fontSize: 16,
   borderRadius: 8,
   border: "none",
-  background: "#0066ff",
-  color: "white",
   cursor: "pointer",
+};
+
+const softNotice: React.CSSProperties = {
+  background: "var(--parley-secondary-bg)",
+  borderRadius: 8,
+  padding: "10px 12px",
+  margin: "12px 0",
+  fontSize: 13,
+  lineHeight: 1.5,
 };
 
 function Page({ children }: { children: React.ReactNode }) {
@@ -181,5 +229,5 @@ function Page({ children }: { children: React.ReactNode }) {
 }
 
 function ErrLine({ children }: { children: React.ReactNode }) {
-  return <p style={{ color: "crimson", marginTop: 12, wordBreak: "break-word" }}>{children}</p>;
+  return <p style={{ color: "var(--parley-error)", marginTop: 12, wordBreak: "break-word" }}>{children}</p>;
 }

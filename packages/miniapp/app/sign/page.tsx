@@ -19,6 +19,7 @@ import { Suspense, useEffect, useMemo, useState } from "react";
 import {
   useAccount,
   useConnect,
+  useDisconnect,
   useSignTypedData,
   useSwitchChain,
   useWriteContract,
@@ -32,10 +33,11 @@ import {
   PARLEY_EIP712_DOMAIN,
   type DealTerms,
 } from "@parley/shared";
-import { sendResult } from "../../lib/telegram";
+import { sendCancel, sendResult } from "../../lib/telegram";
 import { SEPOLIA_CHAIN_ID } from "../../lib/walletconnect";
 import { MiniAppHeader } from "../../lib/header";
 import { formatTxError } from "../../lib/tx-error";
+import { estimateContractOverrides } from "../../lib/gas-estimator";
 
 const SETTLEMENT_ADDRESS = (process.env["NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS"] ??
   "0x0000000000000000000000000000000000000000") as Hex;
@@ -70,6 +72,7 @@ function SignInner() {
 
   const { isConnected, address, chainId } = useAccount();
   const { connect, connectors, isPending: connecting } = useConnect();
+  const { disconnect } = useDisconnect();
 
   const { signTypedDataAsync } = useSignTypedData();
   const { writeContractAsync } = useWriteContract();
@@ -148,15 +151,71 @@ function SignInner() {
     nonce: BigInt(deal.nonce),
   };
 
+  // Hard block on expired offers. Without this the user signs the EIP-712
+  // typed-data, pays gas to call lockUserSide, and the contract reverts at
+  // the deadline check — wasted clicks and wasted gas. The agent's polling
+  // loop sees `cancelled.reason: "offer_expired"` and re-quotes a fresh
+  // intent rather than re-sending the same dead offer URL. Small clock-skew
+  // buffer (15s) so we don't block trades that race the deadline.
+  const nowSec = Math.floor(Date.now() / 1000);
+  const EXPIRY_BUFFER_SEC = 15;
+  if (nowSec + EXPIRY_BUFFER_SEC >= deal.deadline) {
+    const ageSec = nowSec - deal.deadline;
+    return (
+      <Page>
+        <h1>Offer expired</h1>
+        <p style={{ color: "var(--parley-hint)", marginTop: 0 }}>
+          The market maker's quote on this trade expired{" "}
+          {ageSec < 60
+            ? `${ageSec}s ago`
+            : `${Math.floor(ageSec / 60)} min ago`}
+          . Signing now would just burn gas — the contract rejects deals past
+          their deadline. Tap Cancel and the bot will request a fresh quote.
+        </p>
+        <ul style={list}>
+          <li><b>Deadline:</b> {new Date(deal.deadline * 1000).toLocaleTimeString()}</li>
+          <li><b>Now:</b> {new Date(nowSec * 1000).toLocaleTimeString()}</li>
+        </ul>
+        <button
+          onClick={() => sendCancel("offer_expired")}
+          style={btn}
+        >
+          Cancel and return to bot
+        </button>
+      </Page>
+    );
+  }
+
   if (isConnected && address && deal.user.toLowerCase() !== address.toLowerCase()) {
+    // Hard block: signing here would produce a Deal sig recoverable to the
+    // wrong wallet, which Settlement.lockUserSide rejects on-chain. Bail
+    // with a Cancel button so the agent can recover instead of stranding
+    // the user at a dead-end red message.
+    const expected = deal.user;
+    const got = address;
     return (
       <Page>
         <h1>Wrong wallet</h1>
-        <ErrLine>
-          Deal binds wallet <code>{deal.user.slice(0, 10)}…</code>, but the connected wallet
-          is <code>{address.slice(0, 10)}…</code>. Disconnect and reconnect with the matching
-          wallet.
-        </ErrLine>
+        <p style={{ color: "var(--parley-hint)", marginTop: 0 }}>
+          The bot is expecting one wallet, you're connected with another. Tap
+          Cancel below — the bot will guide you through the recovery options.
+        </p>
+        <ul style={list}>
+          <li><b>Bot expects:</b> <code>{shortAddr(expected)}</code></li>
+          <li><b>You're connected:</b> <code>{shortAddr(got)}</code></li>
+        </ul>
+        <button
+          onClick={() => {
+            disconnect();
+            sendCancel("wallet_mismatch", {
+              expected_wallet: expected as `0x${string}`,
+              got_wallet: got as `0x${string}`,
+            });
+          }}
+          style={btn}
+        >
+          Cancel and return to bot
+        </button>
       </Page>
     );
   }
@@ -169,11 +228,21 @@ function SignInner() {
         await switchChainAsync({ chainId: SEPOLIA_CHAIN_ID });
       }
       setStep("approving");
+      // Pre-fill gas + fees so MetaMask Mobile shows a real Sepolia number
+      // instead of its aggressive default. See lib/gas-estimator.ts.
+      const overrides = await estimateContractOverrides(publicClient, {
+        address: deal.tokenA,
+        abi: ERC20_ABI,
+        functionName: "approve",
+        args: [SETTLEMENT_ADDRESS, MAX_UINT256],
+        account: address!,
+      });
       const tx = await writeContractAsync({
         address: deal.tokenA,
         abi: ERC20_ABI,
         functionName: "approve",
         args: [SETTLEMENT_ADDRESS, MAX_UINT256],
+        ...overrides,
       });
       await publicClient.waitForTransactionReceipt({ hash: tx, confirmations: 1 });
       setAllowance(MAX_UINT256);
@@ -187,6 +256,16 @@ function SignInner() {
   async function signAndSubmit() {
     if (!address || !deal || !offerId || !tid) return;
     setError(null);
+
+    // Re-check expiry at submit time. The page-render guard catches the
+    // common case (user opens an already-expired link); this catches the
+    // rarer race where the user reads the page and the deadline elapses
+    // while they're still on it.
+    if (Math.floor(Date.now() / 1000) + 15 >= deal.deadline) {
+      sendCancel("offer_expired");
+      return;
+    }
+
     try {
       // Settlement contract lives on Sepolia; both the typed-data domain and
       // the on-chain submission require the wallet to be on the same chain.
@@ -235,11 +314,25 @@ function SignInner() {
 
       // 3/3: lockUserSide submission.
       setStep("submitting");
+      // Pre-fill gas params (see lib/gas-estimator.ts). Also acts as a
+      // pre-flight: if the contract would revert (deadline expired
+      // mid-flow, allowance vanished, etc.), estimateContractGas surfaces
+      // the reason now rather than after a failed signed tx.
+      const lockOverrides = publicClient
+        ? await estimateContractOverrides(publicClient, {
+            address: SETTLEMENT_ADDRESS,
+            abi: SETTLEMENT_ABI,
+            functionName: "lockUserSide",
+            args: [dealMessage, dealSig],
+            account: address!,
+          })
+        : undefined;
       const tx = await writeContractAsync({
         address: SETTLEMENT_ADDRESS,
         abi: SETTLEMENT_ABI,
         functionName: "lockUserSide",
         args: [dealMessage, dealSig],
+        ...(lockOverrides ?? {}),
       });
       setTxHash(tx);
 
@@ -266,7 +359,9 @@ function SignInner() {
     return (
       <Page>
         <h1>Sign and lock</h1>
-        <p style={{ opacity: 0.7 }}>Connect your wallet to continue.</p>
+        <p style={{ color: "var(--parley-hint)" }}>
+          Connect wallet <code>{shortAddr(deal.user)}</code> to continue.
+        </p>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {connectors.map((c) => (
             <button
@@ -292,16 +387,16 @@ function SignInner() {
         <li><b>MM:</b> <code>{short(deal.mm)}</code></li>
         <li><b>Deadline:</b> {new Date(deal.deadline * 1000).toLocaleString()}</li>
       </ul>
-      <p style={{ fontSize: 13, opacity: 0.7 }}>
+      <p style={{ fontSize: 13, color: "var(--parley-hint)" }}>
         Your wallet will show the full deal in the EIP-712 prompt. Verify the
         amounts there before approving.
       </p>
       {step === "checking_allowance" && (
-        <p style={{ fontSize: 13, opacity: 0.7 }}>Checking token allowance…</p>
+        <p style={{ fontSize: 13, color: "var(--parley-hint)" }}>Checking token allowance…</p>
       )}
       {step === "needs_approval" || step === "approving" ? (
         <>
-          <p style={{ fontSize: 13, opacity: 0.7 }}>
+          <p style={{ fontSize: 13, color: "var(--parley-hint)" }}>
             Settlement isn't yet approved to spend your token. One-time on-chain
             approval is required before you can lock.
           </p>
@@ -365,18 +460,24 @@ function short(s: string): string {
   return s.length > 14 ? `${s.slice(0, 8)}…${s.slice(-6)}` : s;
 }
 
+/** Tighter form for wallet addresses on the wallet-mismatch screen, where
+ *  visual scanability of "0xAA44…864f" matters more than character density. */
+function shortAddr(a: string): string {
+  return `${a.slice(0, 6)}…${a.slice(-4)}`;
+}
+
 const btn: React.CSSProperties = {
+  background: "var(--parley-btn-bg)",
+  color: "var(--parley-btn-fg)",
   padding: "12px 20px",
   fontSize: 16,
   borderRadius: 8,
   border: "none",
-  background: "#0066ff",
-  color: "white",
   cursor: "pointer",
 };
 
 const list: React.CSSProperties = {
-  background: "#f6f6f6",
+  background: "var(--parley-secondary-bg)",
   borderRadius: 8,
   padding: "12px 20px",
   listStyle: "none",
@@ -392,5 +493,5 @@ function Page({ children }: { children: React.ReactNode }) {
 }
 
 function ErrLine({ children }: { children: React.ReactNode }) {
-  return <p style={{ color: "crimson", marginTop: 12, wordBreak: "break-word" }}>{children}</p>;
+  return <p style={{ color: "var(--parley-error)", marginTop: 12, wordBreak: "break-word" }}>{children}</p>;
 }
