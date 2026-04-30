@@ -1,0 +1,4 @@
+# State dir — local-only, per compose.yml.
+# Subdirectories `user-agent/` and `mm-agent/` hold each agent's `axl.pem`.
+# Generate with `make axl-keys` (see Makefile).
+# Never commit .pem files; .gitignore covers them.

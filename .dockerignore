@@ -1,0 +1,41 @@
+# Keep the build context lean. node_modules in particular is huge and gets
+# rebuilt inside images; never copy from host.
+
+**/node_modules/
+**/.next/
+**/dist/
+**/*.tsbuildinfo
+
+# Foundry artifacts — contracts package isn't built into the runtime images.
+packages/contracts/cache/
+packages/contracts/out/
+packages/contracts/broadcast/
+
+# Local-dev cruft.
+.git/
+.git_disabled/
+.github/
+.vscode/
+.idea/
+.DS_Store
+
+# Secrets — never enter the image. `.env` is mounted at runtime by compose.
+.env
+.env.*
+!.env.example
+**/*.pem
+axl-test/
+
+# Test scratch / output.
+/tmp/
+**/coverage/
+**/*.log
+
+# Plans / claude scratch.
+.claude/
+
+# These belong only inside their respective images, not in build context
+# of *other* images. (Each Dockerfile filters what it COPYs explicitly,
+# but pruning here speeds up `docker build`.)
+docs/
+artifacts/build.py

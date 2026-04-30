@@ -1,0 +1,85 @@
+# syntax=docker/dockerfile:1.7
+#
+# MM Agent image — deterministic TS daemon + axl-node Go binary. No LLM,
+# no Python, no Hermes; smaller and faster to rebuild than the User Agent.
+#
+# Per ROADMAP.md Phase 6a: "MM Agent image — Node 24 base with the AXL Go
+# binary and the compiled MM Agent."
+
+# ---------------------------------------------------------------------------
+# Stage 1: AXL Go binary. Same pin/build as the User Agent image.
+# ---------------------------------------------------------------------------
+FROM golang:1.25-alpine AS axl-builder
+
+ARG AXL_REPO=https://github.com/gensyn-ai/axl.git
+ARG AXL_REF=9cba555
+
+RUN apk add --no-cache git
+WORKDIR /src
+RUN git clone "${AXL_REPO}" axl \
+    && cd axl \
+    && git checkout "${AXL_REF}" \
+    && go mod download \
+    && go build -trimpath -ldflags="-s -w" -o /out/axl-node ./cmd/node/
+
+# ---------------------------------------------------------------------------
+# Stage 2: TS build (shared types + mm-agent).
+# ---------------------------------------------------------------------------
+FROM node:24-bookworm-slim AS node-builder
+
+RUN corepack enable && corepack prepare pnpm@10.29.3 --activate
+
+WORKDIR /repo
+
+COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json ./
+COPY packages/shared/package.json packages/shared/
+COPY packages/mm-agent/package.json packages/mm-agent/
+COPY packages/user-agent/package.json packages/user-agent/
+COPY packages/user-agent/mcps/axl-mcp/package.json packages/user-agent/mcps/axl-mcp/
+COPY packages/user-agent/mcps/og-mcp/package.json packages/user-agent/mcps/og-mcp/
+COPY packages/miniapp/package.json packages/miniapp/
+COPY packages/contracts/package.json packages/contracts/
+
+RUN pnpm install --frozen-lockfile \
+    --filter @parley/shared... \
+    --filter @parley/mm-agent...
+
+COPY packages/shared   packages/shared
+COPY packages/mm-agent packages/mm-agent
+
+RUN pnpm -F @parley/shared   build \
+    && pnpm -F @parley/mm-agent build
+
+# ---------------------------------------------------------------------------
+# Stage 3: Runtime — Node + AXL binary + tini.
+# ---------------------------------------------------------------------------
+FROM node:24-bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tini wget \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --shell /bin/bash --uid 10001 parley
+
+WORKDIR /opt/parley
+
+COPY --from=axl-builder /out/axl-node /usr/local/bin/axl-node
+
+COPY --from=node-builder /repo/node_modules                    /opt/parley/node_modules
+COPY --from=node-builder /repo/packages/shared/dist            /opt/parley/packages/shared/dist
+COPY --from=node-builder /repo/packages/shared/package.json    /opt/parley/packages/shared/package.json
+COPY --from=node-builder /repo/packages/mm-agent/dist          /opt/parley/packages/mm-agent/dist
+COPY --from=node-builder /repo/packages/mm-agent/package.json  /opt/parley/packages/mm-agent/package.json
+COPY --from=node-builder /repo/packages/mm-agent/node_modules  /opt/parley/packages/mm-agent/node_modules
+
+COPY infra/axl/node-config.mm-agent.json /opt/parley/axl/node-config.json
+COPY infra/entrypoints/mm-agent.sh       /usr/local/bin/mm-agent-entrypoint
+
+RUN mkdir -p /run/parley \
+    && chmod +x /usr/local/bin/mm-agent-entrypoint \
+    && chown -R parley:parley /opt/parley /run/parley
+
+USER parley
+EXPOSE 9001
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/mm-agent-entrypoint"]

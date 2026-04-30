@@ -1,0 +1,84 @@
+# syntax=docker/dockerfile:1.7
+#
+# Mini App image — Next.js 14 (App Router) with WalletConnect + injected
+# connectors. NEXT_PUBLIC_* values are baked at build time per
+# deployment.md §4. Server-only secrets (e.g. MINIAPP_JWT_SIGNING_KEY) are
+# read at runtime from the mounted .env.
+#
+# Per ROADMAP.md Phase 6a: "Mini App image — Node 24 base with .next/
+# produced by next build. NEXT_PUBLIC_* values baked at build time."
+
+# ---------------------------------------------------------------------------
+# Stage 1: Build the Next.js app + sync logo assets.
+# ---------------------------------------------------------------------------
+FROM node:24-bookworm-slim AS builder
+
+RUN corepack enable && corepack prepare pnpm@10.29.3 --activate
+
+WORKDIR /repo
+
+# Lockfile + manifests first for caching.
+COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json ./
+COPY packages/shared/package.json packages/shared/
+COPY packages/miniapp/package.json packages/miniapp/
+COPY packages/user-agent/package.json packages/user-agent/
+COPY packages/user-agent/mcps/axl-mcp/package.json packages/user-agent/mcps/axl-mcp/
+COPY packages/user-agent/mcps/og-mcp/package.json packages/user-agent/mcps/og-mcp/
+COPY packages/mm-agent/package.json packages/mm-agent/
+COPY packages/contracts/package.json packages/contracts/
+
+RUN pnpm install --frozen-lockfile \
+    --filter @parley/shared... \
+    --filter @parley/miniapp...
+
+COPY packages/shared  packages/shared
+COPY packages/miniapp packages/miniapp
+COPY artifacts        artifacts
+
+# NEXT_PUBLIC_* values baked into the client bundle. Pass via --build-arg.
+# These are not secrets per se — they're public on the deployed page —
+# but they ARE part of the artifact and changing them requires a rebuild.
+ARG NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID
+ARG NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS
+ARG NEXT_PUBLIC_CHAIN_ID=11155111
+ENV NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID=${NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID} \
+    NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS=${NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS} \
+    NEXT_PUBLIC_CHAIN_ID=${NEXT_PUBLIC_CHAIN_ID}
+
+# Logo + favicon mirror from /artifacts/. Skipping this ships stale icons —
+# Phase 6a requires the build to catch this, hence the explicit step.
+RUN pnpm -F @parley/shared  build \
+    && pnpm -F @parley/miniapp sync-assets \
+    && pnpm -F @parley/miniapp build
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime — Node 24 slim, standalone server bundle, non-root.
+# ---------------------------------------------------------------------------
+FROM node:24-bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tini wget \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --shell /bin/bash --uid 10001 parley
+
+WORKDIR /app
+
+# next.config.mjs has `output: "standalone"` — Next emits a self-contained
+# server.js + the minimal node_modules subset under .next/standalone.
+COPY --from=builder /repo/packages/miniapp/.next/standalone /app
+COPY --from=builder /repo/packages/miniapp/.next/static     /app/packages/miniapp/.next/static
+COPY --from=builder /repo/packages/miniapp/public           /app/packages/miniapp/public
+
+USER parley
+
+ENV NODE_ENV=production \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+
+EXPOSE 3000
+
+# Standalone output's server is at packages/miniapp/server.js (preserves
+# the workspace path). Run it directly.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "packages/miniapp/server.js"]

@@ -1,0 +1,115 @@
+# Phase 6a: local Docker validation. Three services, one per host (per
+# deployment.md §1's "one container per host" recommendation). Each agent
+# image bundles its own AXL node so the mesh has two distinct identities.
+#
+# Bring-up: `make deploy-local` (or `docker compose up -d --build`).
+#
+# State that must survive restarts (deployment.md §3):
+#   - axl.pem for each agent  → bind-mount from ./infra/state/<agent>/
+#   - Hermes' ~/.hermes state → named volume `hermes_state`
+#
+# Single root .env mounted read-only into each container; never COPY'd into
+# images. Per-service env filtering happens via `environment:` overrides
+# below for hard-segregated secrets (defense in depth).
+
+name: parley
+
+services:
+
+  user-agent:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.user-agent
+    env_file:
+      - .env
+    environment:
+      AXL_HTTP_URL: http://127.0.0.1:9002
+      AXL_PRIVATE_KEY_PATH: /run/parley/axl.pem
+      # Don't leak the MM hot wallet to the User Agent container.
+      MM_EVM_PRIVATE_KEY: ""
+    volumes:
+      # AXL identity — must be mounted; entrypoint refuses to start without it.
+      - ./infra/state/user-agent/axl.pem:/run/parley/axl.pem:ro
+      # Hermes per-user state (sessions, pairing, conversation memory).
+      - hermes_state:/home/parley/.hermes
+    ports:
+      # AXL TLS listener: peer reachability inside the compose network only;
+      # publish the host port if the User Agent is reachable from the public
+      # internet (Phase 6b on a real VPS).
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      # AXL HTTP API exposes /topology on 9002 (localhost only). Curl from
+      # inside the container.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/topology >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+
+  mm-agent:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.mm-agent
+    env_file:
+      - .env
+    environment:
+      AXL_HTTP_URL: http://127.0.0.1:9002
+      AXL_PRIVATE_KEY_PATH: /run/parley/axl.pem
+      # Don't leak Hermes / Telegram secrets to the MM Agent container.
+      TELEGRAM_BOT_TOKEN: ""
+      ANTHROPIC_API_KEY: ""
+    volumes:
+      - ./infra/state/mm-agent/axl.pem:/run/parley/axl.pem:ro
+    ports:
+      - "127.0.0.1:9011:9001"
+    depends_on:
+      user-agent:
+        # Wait until AXL on the User Agent side is healthy — otherwise the
+        # MM AXL node can't peer (compose.yml's depends_on makes sense here
+        # because the AXL Peers list is one-way: mm → user).
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/topology >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+
+  miniapp:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.miniapp
+      args:
+        # NEXT_PUBLIC_* are baked at build time — sourced from the host shell
+        # / .env via compose's variable interpolation. Compose reads .env
+        # from the working dir by default, so these resolve before docker
+        # build sees them.
+        NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID: ${NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID}
+        NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS: ${NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS}
+        NEXT_PUBLIC_CHAIN_ID: ${NEXT_PUBLIC_CHAIN_ID:-11155111}
+    env_file:
+      - .env
+    environment:
+      # Defense in depth: the Mini App container has no use for any agent
+      # private keys or LLM credentials.
+      MM_EVM_PRIVATE_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      ZG_COMPUTE_KEY: ""
+      OG_PRIVATE_KEY: ""
+      PARLEY_ROOT_PRIVATE_KEY: ""
+    ports:
+      - "3000:3000"
+    healthcheck:
+      # Next.js root page returns HTML when the server is up.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  hermes_state:
+    name: parley_hermes_state

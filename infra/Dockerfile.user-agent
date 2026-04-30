@@ -1,0 +1,152 @@
+# syntax=docker/dockerfile:1.7
+#
+# User Agent image — Hermes (Python) + MCP servers + AXL sidecar +
+# axl-node Go binary. Multi-stage so the runtime stays lean: each builder
+# stage is discarded after we COPY its output into the final image.
+#
+# Per ROADMAP.md Phase 6a: "User Agent image — Python 3.11+ base for Hermes
+# (installed via RUN curl | bash, pinned to a specific Hermes release for
+# reproducibility), plus Node 24 for the MCP servers and AXL sidecar, plus
+# the AXL Go binary copied in. Multi-stage build to keep the final image lean."
+
+# ---------------------------------------------------------------------------
+# Stage 1: Build the AXL Go binary.
+# Pinned to gensyn-ai/axl@${AXL_REF}; bump deliberately when upgrading the mesh.
+# ---------------------------------------------------------------------------
+FROM golang:1.25-alpine AS axl-builder
+
+ARG AXL_REPO=https://github.com/gensyn-ai/axl.git
+ARG AXL_REF=9cba555
+
+RUN apk add --no-cache git
+WORKDIR /src
+RUN git clone "${AXL_REPO}" axl \
+    && cd axl \
+    && git checkout "${AXL_REF}" \
+    && go mod download \
+    && go build -trimpath -ldflags="-s -w" -o /out/axl-node ./cmd/node/
+
+# ---------------------------------------------------------------------------
+# Stage 2: Build the TS workspace (shared types + MCPs + AXL sidecar).
+# ---------------------------------------------------------------------------
+FROM node:24-bookworm-slim AS node-builder
+
+RUN corepack enable && corepack prepare pnpm@10.29.3 --activate
+
+WORKDIR /repo
+
+# Copy lockfile + workspace manifests first so dep install is cached
+# independently of source changes.
+COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json ./
+COPY packages/shared/package.json packages/shared/
+COPY packages/user-agent/package.json packages/user-agent/
+COPY packages/user-agent/mcps/axl-mcp/package.json packages/user-agent/mcps/axl-mcp/
+COPY packages/user-agent/mcps/og-mcp/package.json packages/user-agent/mcps/og-mcp/
+COPY packages/user-agent/mcps/tg-mcp/package.json packages/user-agent/mcps/tg-mcp/
+COPY packages/mm-agent/package.json packages/mm-agent/
+COPY packages/miniapp/package.json packages/miniapp/
+COPY packages/contracts/package.json packages/contracts/
+
+# Frozen install for reproducibility. Keep dev deps — TypeScript needs them
+# to compile; runtime image is a separate stage and copies only `dist/`.
+RUN pnpm install --frozen-lockfile \
+    --filter @parley/shared... \
+    --filter @parley/user-agent... \
+    --filter @parley/og-mcp... \
+    --filter @parley/axl-mcp... \
+    --filter @parley/tg-mcp...
+
+# Now bring in source for the TS-first packages we need.
+COPY packages/shared packages/shared
+COPY packages/user-agent packages/user-agent
+
+RUN pnpm -F @parley/shared build \
+    && pnpm -F @parley/og-mcp build \
+    && pnpm -F @parley/axl-mcp build \
+    && pnpm -F @parley/tg-mcp build \
+    && pnpm -F @parley/user-agent build
+
+# ---------------------------------------------------------------------------
+# Stage 3: Runtime — Python (Hermes) + Node (MCPs / sidecar) + AXL binary.
+# ---------------------------------------------------------------------------
+FROM python:3.11-slim-bookworm AS runtime
+
+# Hermes upstream version pin. Bump deliberately. Verified locally at
+# v0.11.0 (2026.4.23). Install method per
+# https://hermes-agent.nousresearch.com/ — a curl|sh installer that drops
+# a binary into ~/.local/bin and a Python project into ~/.hermes/hermes-agent.
+ARG HERMES_VERSION=0.11.0
+ARG HERMES_INSTALL_URL=https://hermes-agent.nousresearch.com/install.sh
+
+# Install Node 24 (NodeSource), tini, supervisord, curl, ca-certs, bash
+# (Hermes' install.sh requires bash; the python slim base ships dash as /bin/sh).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg tini supervisor bash git wget \
+    && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir --root-user-action=ignore "pyyaml>=6.0,<7"
+
+# Non-root user. Hermes' state dir lives in $HOME/.hermes which compose
+# mounts as a named volume — see compose.yml.
+RUN useradd --create-home --shell /bin/bash --uid 10001 parley
+USER parley
+WORKDIR /home/parley
+
+# Install Hermes pinned. The upstream installer is interactive in some
+# branches; pass HERMES_VERSION through the env it reads. If install fails,
+# the image build fails — surfacing the issue early per Phase 6a's "version
+# pin called out" requirement.
+RUN curl -fsSL "${HERMES_INSTALL_URL}" -o /tmp/hermes-install.sh \
+    && HERMES_VERSION="${HERMES_VERSION}" bash /tmp/hermes-install.sh \
+    && rm -f /tmp/hermes-install.sh
+
+ENV PATH="/home/parley/.local/bin:${PATH}"
+
+# Bring in the AXL binary + Node-built artifacts + repo runtime files.
+USER root
+
+RUN mkdir -p /opt/parley/dist /opt/parley/hermes-config /run/parley \
+    && chown -R parley:parley /opt/parley /run/parley
+
+COPY --from=axl-builder /out/axl-node /usr/local/bin/axl-node
+
+# We need the workspace's node_modules for runtime imports (workspace:*
+# linkage). Ship the whole repo's node_modules — slim is acceptable for the
+# demo; tighter pruning is a Phase 7 concern.
+COPY --from=node-builder /repo/node_modules                                          /opt/parley/node_modules
+COPY --from=node-builder /repo/packages/shared/dist                                  /opt/parley/packages/shared/dist
+COPY --from=node-builder /repo/packages/shared/package.json                          /opt/parley/packages/shared/package.json
+COPY --from=node-builder /repo/packages/user-agent/dist                              /opt/parley/packages/user-agent/dist
+COPY --from=node-builder /repo/packages/user-agent/package.json                      /opt/parley/packages/user-agent/package.json
+COPY --from=node-builder /repo/packages/user-agent/node_modules                      /opt/parley/packages/user-agent/node_modules
+COPY --from=node-builder /repo/packages/user-agent/mcps/og-mcp/dist                  /opt/parley/packages/user-agent/mcps/og-mcp/dist
+COPY --from=node-builder /repo/packages/user-agent/mcps/og-mcp/package.json          /opt/parley/packages/user-agent/mcps/og-mcp/package.json
+COPY --from=node-builder /repo/packages/user-agent/mcps/og-mcp/node_modules          /opt/parley/packages/user-agent/mcps/og-mcp/node_modules
+COPY --from=node-builder /repo/packages/user-agent/mcps/axl-mcp/dist                 /opt/parley/packages/user-agent/mcps/axl-mcp/dist
+COPY --from=node-builder /repo/packages/user-agent/mcps/axl-mcp/package.json         /opt/parley/packages/user-agent/mcps/axl-mcp/package.json
+COPY --from=node-builder /repo/packages/user-agent/mcps/axl-mcp/node_modules         /opt/parley/packages/user-agent/mcps/axl-mcp/node_modules
+COPY --from=node-builder /repo/packages/user-agent/mcps/tg-mcp/dist                  /opt/parley/packages/user-agent/mcps/tg-mcp/dist
+COPY --from=node-builder /repo/packages/user-agent/mcps/tg-mcp/package.json          /opt/parley/packages/user-agent/mcps/tg-mcp/package.json
+COPY --from=node-builder /repo/packages/user-agent/mcps/tg-mcp/node_modules          /opt/parley/packages/user-agent/mcps/tg-mcp/node_modules
+
+# Hermes config (SOUL.md + skills) is the source of truth in the repo;
+# the entrypoint syncs it into ~/.hermes/ on container start (deployment.md §3).
+COPY packages/user-agent/hermes-config /opt/parley/hermes-config
+
+# AXL config + supervisord config + entrypoint.
+COPY infra/axl/node-config.user-agent.json /opt/parley/axl/node-config.json
+COPY infra/supervisord/user-agent.conf     /etc/supervisor/conf.d/parley.conf
+COPY infra/entrypoints/user-agent.sh       /usr/local/bin/user-agent-entrypoint
+RUN chmod +x /usr/local/bin/user-agent-entrypoint \
+    && chown -R parley:parley /opt/parley
+
+USER parley
+WORKDIR /opt/parley
+
+# AXL listens on 9001 (TLS, peer-to-peer); HTTP API on 9002 stays bound
+# to localhost (deployment.md §5). Only 9001 needs publishing in compose.
+EXPOSE 9001
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/user-agent-entrypoint"]
