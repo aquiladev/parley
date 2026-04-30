@@ -48,6 +48,25 @@ function getSigner(): ethers.Wallet {
   return signerSingleton;
 }
 
+// One shared OG_PRIVATE_KEY signs uploads from both MM Agents and the User
+// Agent's og-mcp. With Phase 7 (multi-MM) the address has one nonce queue
+// across N concurrent publishers; collisions surface as "replacement
+// transaction underpriced". Wait + retry with a fresh nonce.
+const NONCE_RETRY_DELAYS_MS = [8000, 15000, 25000];
+
+function isNonceCollision(err: unknown): boolean {
+  const code = (err as { code?: string })?.code ?? "";
+  const msg = String((err as { message?: string })?.message ?? err).toLowerCase();
+  return (
+    code === "REPLACEMENT_UNDERPRICED" ||
+    code === "NONCE_EXPIRED" ||
+    msg.includes("replacement transaction underpriced") ||
+    msg.includes("replacement fee too low") ||
+    msg.includes("nonce too low") ||
+    msg.includes("nonce has already been used")
+  );
+}
+
 /** Upload a TradeRecord, return its root hash. */
 export async function uploadTradeRecord(record: TradeRecord): Promise<string> {
   const indexer = getIndexer();
@@ -61,19 +80,31 @@ export async function uploadTradeRecord(record: TradeRecord): Promise<string> {
   const path = join(dir, `${record.trade_id}.json`);
   writeFileSync(path, bytes);
   try {
-    const zgFile = await ZgFile.fromFilePath(path);
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const [tx, err] = await indexer.upload(zgFile, STORAGE_RPC_URL, signer as any);
-      if (err !== null) {
-        throw new Error(`upload: ${err}`);
+    for (let attempt = 0; attempt <= NONCE_RETRY_DELAYS_MS.length; attempt++) {
+      const zgFile = await ZgFile.fromFilePath(path);
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const [tx, err] = await indexer.upload(zgFile, STORAGE_RPC_URL, signer as any);
+        if (err !== null) {
+          const wrapped = new Error(`upload: ${err}`);
+          if (isNonceCollision(err) && attempt < NONCE_RETRY_DELAYS_MS.length) {
+            const delay = NONCE_RETRY_DELAYS_MS[attempt]!;
+            process.stderr.write(
+              `[og-storage] trade_record nonce collision (attempt ${attempt + 1}); retry in ${delay}ms\n`,
+            );
+            await new Promise((r) => setTimeout(r, delay));
+            continue;
+          }
+          throw wrapped;
+        }
+        const rootHash = "rootHash" in tx ? tx.rootHash : tx.rootHashes[0];
+        if (!rootHash) throw new Error("upload returned no root hash");
+        return rootHash as string;
+      } finally {
+        await zgFile.close();
       }
-      const rootHash = "rootHash" in tx ? tx.rootHash : tx.rootHashes[0];
-      if (!rootHash) throw new Error("upload returned no root hash");
-      return rootHash as string;
-    } finally {
-      await zgFile.close();
     }
+    throw new Error("upload: trade_record exhausted nonce-collision retries");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

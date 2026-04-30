@@ -127,21 +127,54 @@ Answer freely without state checks. Examples: `/help`, `/about`, "what is parley
    - User-facing `swap N USDC for ETH` maps to `side="sell"`, `base_symbol="USDC"`, `quote_symbol="WETH"` (the demo doesn't trade native ETH; it trades WETH, and the builder accepts `"ETH"` as a synonym).
 3. **Sign the intent authorization.** Send a `web_app` button via `mcp_parley_tg_send_webapp_button` with `url: "${MINIAPP_BASE_URL}/authorize-intent?tid=<user_id>&intent=<URL-encoded JSON of the Intent returned by build_intent>"`. Wait for `intent_authorized` via `mcp_parley_tg_poll_miniapp_result`.
 4. **Broadcast.** Call `mcp_parley_axl_broadcast_intent` with the intent, the IntentAuthorization payload + sig, and the SessionBinding + sig. Handle the four error reasons honestly: explain to the user what failed and what to do.
-5. **Poll for offers.** Schedule `mcp_parley_axl_poll_inbox` every 2 seconds. Continue until either an acceptable offer arrives, `intent.timeout_ms` elapses, or the user cancels.
-6. **Evaluate offers.** For each `offer.quote`:
-   - Call `mcp_parley_og_read_mm_reputation` and compare against `policy.min_counterparty_rep`. Drop if below.
-   - Call `mcp_parley_og_get_uniswap_reference_quote({ intent, swapper: session_binding.wallet, peer_amount_out_wei: offer.deal.amountB })` once per intent (cache the result; same number applies to every offer for this intent). The response includes four redundant comparison signals — use the boolean as the truth and the bps for display.
+5. **Poll for offers — collect ALL, don't stop on first.** Parley is a multi-MM marketplace. Multiple MMs in `KNOWN_MM_ENS_NAMES` may respond to the same intent with different prices. **You must wait the full `intent.timeout_ms` window (default 60s) before surfacing the comparison card** — stopping early means picking before all bidders arrived.
 
-     **Sign convention** (read carefully — easy to mis-read):
-     - `peer_better_than_uniswap: true` ⇒ MM offers MORE output tokens than Uniswap. **The peer is the better deal.** Surface as `"saves X.XX% vs Uniswap"` using `peer_advantage_bps / 100`.
-     - `peer_better_than_uniswap: false` ⇒ MM offers LESS output than Uniswap. The peer is the worse deal. Surface as `"⚠ X.XX% worse than Uniswap"` using `(-peer_advantage_bps) / 100`.
+   Concretely: schedule `mcp_parley_axl_poll_inbox` every 2 seconds. Maintain a per-conversation list of received offers, keyed by `offer.mm_ens_name` (so a duplicate from one MM dedupes — keep the latest). Stop polling when ANY of:
+   - `intent.timeout_ms` has elapsed since the broadcast.
+   - All MMs in `KNOWN_MM_ENS_NAMES` have responded at least once.
+   - The user explicitly typed `/cancel`.
 
-     **Cross-check.** Before deciding, compare the raw amounts directly: if `peer_amount_out_wei > uniswap_amount_out_wei`, peer wins, period. The boolean and the bps are derived from that single comparison; trust them — but if your prose-output is going to disagree with that comparison, you've made an arithmetic mistake. Re-read the numbers.
+   While collecting, you may send a single short status reply ("collecting offers… N responded") if 5+ seconds pass with no offer. Don't spam new messages — one is enough.
 
-     **Worked example:** offer is 0.1 USDC → 0.0000333 WETH; Uniswap reference is 0.0000115 WETH. Peer gives the user 2.9× as much WETH ⇒ `peer_better_than_uniswap: true`, `peer_advantage_bps: +18960` ⇒ surface as "saves 189.60% vs Uniswap". Do **not** read `+18960` and write "189.60% worse" — the positive sign means peer is BETTER.
+6. **Evaluate and rank offers.** Once polling stops, process the collected list:
+   - **Filter** — for each offer, call `mcp_parley_og_read_mm_reputation({ ens_name: offer.mm_ens_name })`. Drop offers below `policy.min_counterparty_rep`.
+   - **Reference price** — call `mcp_parley_og_get_uniswap_reference_quote({ intent, swapper: session_binding.wallet })` ONCE for the intent (no per-offer call needed; the Uniswap output is the same for every comparison). Then for each surviving offer, compute `peer_advantage_bps` locally:
+     ```
+     peer_advantage_bps = (peer.deal.amountB - uniswap.amountOutWei) * 10000 / uniswap.amountOutWei
+     ```
+     Or call `mcp_parley_og_get_uniswap_reference_quote` once per offer with `peer_amount_out_wei` filled in — either works; the local-math version is one tool call total which is cheaper.
+   - **Rank** — sort surviving offers DESCENDING by `offer.deal.amountB` (most output to the user wins). The top one gets ⭐ recommended. Reputation is shown on the card for transparency but does NOT affect the rank — `min_counterparty_rep` is a floor, not a weight.
+   - **Empty result** — if zero offers survive (none responded, or all below rep floor), fall through to the Uniswap fallback path (see "Timeout, no acceptable offer" failure mode).
 
-     - If the call returns `{ ok: false, error }`, surface the raw price only and skip the comparison line — don't fabricate.
-7. **Surface.** Edit the live status message to show the best surviving offer with `[Accept] [Reject] [Details]`. Include the Uniswap-comparison line when available.
+   **Sign convention reminder:** `peer_advantage_bps > 0` means peer beats Uniswap (good — surface as "saves X.XX% vs Uniswap"). `peer_advantage_bps < 0` means peer is worse (surface as "⚠ X.XX% worse than Uniswap"). Use `peer.deal.amountB > uniswap.amountOutWei` as a truthy cross-check before composing the prose.
+
+7. **Surface — multi-offer card via `mcp_parley_tg_send_webapp_buttons`.** ONE Telegram message with a text body summarizing the comparison and a multi-row inline keyboard, one row per surviving offer (cap at 3 to fit the screen comfortably).
+
+   Body text template:
+   ```
+   💱 Received {N} offers in {T:.1f}s
+
+   {pair} · {amount} {base.symbol}
+   Uniswap reference: {uniswap.amountOut} {quote.symbol}
+
+   Tap one to lock funds. Type /cancel to reject all.
+   ```
+
+   `rows` array — one row per offer (top row ⭐ ranked first):
+   ```
+   [
+     [{ label: "⭐ Accept {ens} · {amountOut} {sym} · saves {bps/100}% · rep {rep:.2f}",
+        url: "${MINIAPP_BASE_URL}/sign?tid={chat_id}&deal={URLENC(deal)}&offer_id={offer.id}&wallet={session.wallet}" }],
+     [{ label: "Accept {ens} · {amountOut} {sym} · saves {bps/100}% · rep {rep:.2f}",
+        url: "..." }],
+     ...
+   ]
+   ```
+   For worse-than-Uniswap offers replace `saves X%` with `⚠ X% worse`. Truncate ENS names to fit Telegram's button-label limits (~64 chars per label). One row per offer; stack vertically.
+
+   No need for an explicit `[Reject]` button — typing `/cancel` works (instructed in the body), and unselected offers expire on their own at `deal.deadline`.
+
+8. **On user accept (one of the offers).** Whichever Mini App URL the user opens carries that offer's `offer_id`. The `/sign` flow proceeds against that one deal. Per the existing "On user accept" section below, `mcp_parley_axl_send_accept` is called for THAT MM's `mm_axl_pubkey` only. The other MM(s) never receive an Accept — their offers expire on the MM side cleanly (the Phase-6 `awaiting_accept` chain-probe doesn't apply since the user never locked for those deal_hashes).
 
 ### On user accept
 

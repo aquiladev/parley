@@ -46,6 +46,27 @@ function getSigner(): ethers.Wallet {
   return signerSingleton;
 }
 
+// Two MM Agents share OG_PRIVATE_KEY (Phase 7 — single shared 0G payment
+// wallet). One nonce sequence per address means concurrent publishes from
+// mm-1 and mm-2 (and the 2-tx record+index publish even from a single MM)
+// can collide. The 0G testnet RPC then returns "replacement transaction
+// underpriced" / "nonce too low". Wait for the in-flight tx to confirm and
+// retry with a fresh nonce — ethers Wallet auto-fetches `pending` count.
+const NONCE_RETRY_DELAYS_MS = [8000, 15000, 25000];
+
+function isNonceCollision(err: unknown): boolean {
+  const code = (err as { code?: string })?.code ?? "";
+  const msg = String((err as { message?: string })?.message ?? err).toLowerCase();
+  return (
+    code === "REPLACEMENT_UNDERPRICED" ||
+    code === "NONCE_EXPIRED" ||
+    msg.includes("replacement transaction underpriced") ||
+    msg.includes("replacement fee too low") ||
+    msg.includes("nonce too low") ||
+    msg.includes("nonce has already been used")
+  );
+}
+
 /** Upload arbitrary JSON-serializable data, return its 0G root hash. */
 export async function uploadJsonBlob(data: unknown, label = "blob"): Promise<string> {
   const indexer = getIndexer();
@@ -55,17 +76,31 @@ export async function uploadJsonBlob(data: unknown, label = "blob"): Promise<str
   const path = join(dir, `${label}.json`);
   writeFileSync(path, json);
   try {
-    const zgFile = await ZgFile.fromFilePath(path);
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const [tx, err] = await indexer.upload(zgFile, STORAGE_RPC_URL, signer as any);
-      if (err !== null) throw new Error(`upload: ${err}`);
-      const rootHash = "rootHash" in tx ? tx.rootHash : tx.rootHashes[0];
-      if (!rootHash) throw new Error("upload returned no root hash");
-      return rootHash as string;
-    } finally {
-      await zgFile.close();
+    for (let attempt = 0; attempt <= NONCE_RETRY_DELAYS_MS.length; attempt++) {
+      const zgFile = await ZgFile.fromFilePath(path);
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const [tx, err] = await indexer.upload(zgFile, STORAGE_RPC_URL, signer as any);
+        if (err !== null) {
+          const wrapped = new Error(`upload: ${err}`);
+          if (isNonceCollision(err) && attempt < NONCE_RETRY_DELAYS_MS.length) {
+            const delay = NONCE_RETRY_DELAYS_MS[attempt]!;
+            process.stderr.write(
+              `[og-storage] ${label} nonce collision (attempt ${attempt + 1}); retry in ${delay}ms\n`,
+            );
+            await new Promise((r) => setTimeout(r, delay));
+            continue;
+          }
+          throw wrapped;
+        }
+        const rootHash = "rootHash" in tx ? tx.rootHash : tx.rootHashes[0];
+        if (!rootHash) throw new Error("upload returned no root hash");
+        return rootHash as string;
+      } finally {
+        await zgFile.close();
+      }
     }
+    throw new Error(`upload: ${label} exhausted nonce-collision retries`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

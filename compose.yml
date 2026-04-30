@@ -14,6 +14,31 @@
 
 name: parley
 
+# YAML anchor for the MM Agent service shape — both `mm-agent` and
+# `mm-agent-2` share the same build, healthcheck, and dependency on the
+# User Agent. Each service overrides its own per-instance env (key,
+# ENS name, spread) and bind-mounts its own AXL identity. Phase 7 wires
+# the second MM in; from a few it's just N copies of the same template.
+x-mm-agent-base: &mm-agent-base
+  build:
+    context: .
+    dockerfile: infra/Dockerfile.mm-agent
+  env_file:
+    - .env
+  depends_on:
+    user-agent:
+      # Wait until AXL on the User Agent side is healthy — otherwise the
+      # MM AXL node can't peer (compose.yml's depends_on makes sense here
+      # because the AXL Peers list is one-way: mm → user).
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/topology >/dev/null 2>&1 || exit 1"]
+    interval: 10s
+    timeout: 3s
+    retries: 6
+    start_period: 30s
+  restart: unless-stopped
+
 services:
 
   user-agent:
@@ -48,11 +73,7 @@ services:
     restart: unless-stopped
 
   mm-agent:
-    build:
-      context: .
-      dockerfile: infra/Dockerfile.mm-agent
-    env_file:
-      - .env
+    <<: *mm-agent-base
     environment:
       AXL_HTTP_URL: http://127.0.0.1:9002
       AXL_PRIVATE_KEY_PATH: /run/parley/axl.pem
@@ -63,19 +84,30 @@ services:
       - ./infra/state/mm-agent/axl.pem:/run/parley/axl.pem:ro
     ports:
       - "127.0.0.1:9011:9001"
-    depends_on:
-      user-agent:
-        # Wait until AXL on the User Agent side is healthy — otherwise the
-        # MM AXL node can't peer (compose.yml's depends_on makes sense here
-        # because the AXL Peers list is one-way: mm → user).
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/topology >/dev/null 2>&1 || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 6
-      start_period: 30s
-    restart: unless-stopped
+
+  # Second MM Agent — Phase 7. Same image, different config. Brings up a
+  # competing market maker so the User Agent surfaces multiple offers per
+  # intent and the user picks. Only boots when MM2_EVM_PRIVATE_KEY is set
+  # in .env (otherwise the entrypoint refuses to start with a missing-key
+  # error — that's fine; you can leave it absent until you're ready).
+  mm-agent-2:
+    <<: *mm-agent-base
+    environment:
+      AXL_HTTP_URL: http://127.0.0.1:9002
+      AXL_PRIVATE_KEY_PATH: /run/parley/axl.pem
+      TELEGRAM_BOT_TOKEN: ""
+      ANTHROPIC_API_KEY: ""
+      # Per-instance overrides — these are the only values that distinguish
+      # mm-agent-2 from mm-agent. Empty defaults so compose still parses
+      # when MM2_* aren't set; mm-agent will simply fail boot in that case
+      # (intentional — opt-in by setting the env vars).
+      MM_EVM_PRIVATE_KEY: "${MM2_EVM_PRIVATE_KEY:-}"
+      MM_ENS_NAME: "${MM2_ENS_NAME:-mm-2.parley.eth}"
+      MM_SPREAD_BPS: "${MM2_SPREAD_BPS:-30}"
+    volumes:
+      - ./infra/state/mm-agent-2/axl.pem:/run/parley/axl.pem:ro
+    ports:
+      - "127.0.0.1:9012:9001"
 
   miniapp:
     build:

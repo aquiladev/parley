@@ -10,6 +10,7 @@ SHELL := /usr/bin/env bash
 INFRA_STATE := infra/state
 USER_PEM := $(INFRA_STATE)/user-agent/axl.pem
 MM_PEM   := $(INFRA_STATE)/mm-agent/axl.pem
+MM2_PEM  := $(INFRA_STATE)/mm-agent-2/axl.pem
 
 .PHONY: help deploy-local up down logs build axl-keys clean check-env
 
@@ -43,7 +44,7 @@ check-env:
 # AXL identity is per-agent, NOT per-image. Mounting from the host means
 # rebuilding the image doesn't churn keys (which would break ENS axl_pubkey
 # records — see deployment.md §3).
-axl-keys: $(USER_PEM) $(MM_PEM)
+axl-keys: $(USER_PEM) $(MM_PEM) $(MM2_PEM)
 
 $(USER_PEM):
 	@mkdir -p "$$(dirname $@)"
@@ -59,6 +60,19 @@ $(MM_PEM):
 	  openssl genpkey -algorithm ed25519 -out "$@"; \
 	  chmod 600 "$@"; \
 	  echo "Generated $@ — its pubkey must be set on mm-N.parley.eth ENS axl_pubkey record"; \
+	fi
+
+# Phase 7: second MM Agent (mm-agent-2). Same shape as $(MM_PEM); the
+# entrypoint refuses to start without it. Generated alongside the others
+# so `make axl-keys` brings the whole stack up; mm-agent-2 simply won't
+# trade until MM2_EVM_PRIVATE_KEY is set in .env and mm-2.parley.eth is
+# registered.
+$(MM2_PEM):
+	@mkdir -p "$$(dirname $@)"
+	@if [[ ! -f $@ ]]; then \
+	  openssl genpkey -algorithm ed25519 -out "$@"; \
+	  chmod 600 "$@"; \
+	  echo "Generated $@ — its pubkey must be set on mm-2.parley.eth ENS axl_pubkey record"; \
 	fi
 
 build:
