@@ -8,7 +8,7 @@ import type { DealTerms, Intent, Offer, TokenRef } from "@parley/shared";
 
 import { canFill, type Inventory, type InventoryLimits } from "./inventory.js";
 import { dealForSigning, dealHash, DEAL_TYPES } from "./eip712.js";
-import { getReferenceTwap, quote } from "./pricing.js";
+import { quote } from "./pricing.js";
 import type { MmWallet } from "./wallet.js";
 
 const SETTLEMENT_ABI = parseAbi([
@@ -43,19 +43,22 @@ export interface PreparedOffer {
 /** Decide whether to quote on `intent`, build a Deal, return the wire-form
  *  Offer + the Deal both parties will sign on-chain. `inventory` is the live
  *  on-chain `balanceOf` snapshot for the MM hot wallet (taken just before
- *  this call). The caller is responsible for fetching it — see
- *  `fetchInventoryFromChain` in inventory.ts. */
+ *  this call). `referenceTwap1e18` is the current Uniswap mid-price for the
+ *  pair (USDC per WETH × 1e18), pulled from the synchronously-readable
+ *  cache in `uniswap-reference.ts` — caller is responsible for the
+ *  staleness check. Both reads happen at the call site so this function
+ *  stays sync + pure. */
 export function buildOffer(
   intent: Intent,
   inventory: Inventory,
+  referenceTwap1e18: bigint,
   cfg: NegotiatorConfig,
 ): PreparedOffer | null {
   const pair = pairFromIntent(intent, cfg);
   if (!pair) return null;
 
   const intentAmount = parseDecimal(intent.amount, pair.userInToken.decimals);
-  const refTwap = getReferenceTwap();
-  const ourPrice = quote({ uniswap_twap: refTwap, spread_bps: cfg.spreadBps });
+  const ourPrice = quote({ uniswap_twap: referenceTwap1e18, spread_bps: cfg.spreadBps });
 
   const sizing = sizeDeal({
     userInIsWeth: pair.userInIsWeth,

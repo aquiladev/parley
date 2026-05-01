@@ -1,15 +1,17 @@
 // Deterministic pricing — see SPEC §4.2.
 // price = uniswap_twap * (1 + spread_bps / 10000)
 //
-// PHASE 1 SIMPLIFICATION: TWAP is hardcoded to a reference value. Real
-// Uniswap v3 oracle reads land in Phase 4 polish (when ENS + reputation
-// already work). The spread/inventory checks are the pieces that need to
-// be real for Phase 1.
+// Phase 8: the reference price is no longer a hardcoded constant. It flows
+// in from the caller (see `uniswap-reference.ts`, instantiated in
+// `index.ts` and read synchronously inside `handleIntent`). The MM
+// background-refreshes a Uniswap v3 QuoterV2 mid-price for the configured
+// pair every `MM_PRICE_REFRESH_INTERVAL_MS` and declines to quote if the
+// cached value is older than `MM_PRICE_MAX_STALE_MS`. This file's only
+// remaining responsibility is the pure spread-application formula — kept
+// deliberately small and side-effect-free.
 //
-// The reference is expressed as base/quote scaled to 1e18 — for the
-// USDC/WETH demo pair, that's "WETH price in USDC" times 1e18.
-
-const PHASE1_REFERENCE_TWAP_USDC_PER_WETH_1E18 = 3000n * 10n ** 18n;
+// Reference is expressed as base/quote scaled to 1e18 — for the USDC/WETH
+// demo pair, that's "USDC per WETH" times 1e18.
 
 export interface PricingInput {
   uniswap_twap: bigint;
@@ -18,10 +20,4 @@ export interface PricingInput {
 
 export function quote({ uniswap_twap, spread_bps }: PricingInput): bigint {
   return (uniswap_twap * BigInt(10000 + spread_bps)) / 10000n;
-}
-
-/** Phase 1 stub: returns a hardcoded TWAP for USDC/WETH on Sepolia.
- *  Replace with on-chain pool oracle reads in Phase 4. */
-export function getReferenceTwap(): bigint {
-  return PHASE1_REFERENCE_TWAP_USDC_PER_WETH_1E18;
 }

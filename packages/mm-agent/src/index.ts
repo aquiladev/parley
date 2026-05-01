@@ -34,6 +34,11 @@ import {
   type PreparedOffer,
 } from "./negotiator.js";
 import { ReputationPublisher } from "./reputation-publisher.js";
+import {
+  createUniswapReference,
+  type ReferencePair,
+  type UniswapReference,
+} from "./uniswap-reference.js";
 import { buildWallet, type MmWallet } from "./wallet.js";
 
 const POLL_INTERVAL_MS = 2_000;
@@ -66,6 +71,11 @@ interface Env {
   ensName: string;
   offerExpiryMs: number;
   settlementWindowMs: number;
+  /** Background refresh cadence for the Uniswap reference price. */
+  priceRefreshIntervalMs: number;
+  /** Hard staleness gate — decline-to-quote if the cached price is older
+   *  than this when an intent arrives. */
+  priceMaxStaleMs: number;
   knownTokens: { usdc: TokenRef; weth: TokenRef };
 }
 
@@ -96,6 +106,8 @@ function readEnv(): Env {
     ensName: process.env["MM_ENS_NAME"] ?? "mm-1.parley.eth",
     offerExpiryMs: Number(process.env["MM_OFFER_EXPIRY_MS"] ?? "300000"),
     settlementWindowMs: Number(process.env["MM_SETTLEMENT_WINDOW_MS"] ?? "300000"),
+    priceRefreshIntervalMs: Number(process.env["MM_PRICE_REFRESH_INTERVAL_MS"] ?? "15000"),
+    priceMaxStaleMs: Number(process.env["MM_PRICE_MAX_STALE_MS"] ?? "60000"),
     knownTokens: {
       usdc: { chain_id: 11155111, address: usdcAddr, symbol: "USDC", decimals: 6 },
       weth: { chain_id: 11155111, address: wethAddr, symbol: "WETH", decimals: 18 },
@@ -219,6 +231,27 @@ async function main(): Promise<void> {
     throw err;
   }
 
+  // Phase 8: live Uniswap reference price. Background-refreshes the
+  // mid-price for the WETH/USDC pair; intent path reads synchronously
+  // from the in-memory cache. start() blocks on the first fetch so we
+  // either boot with a warm cache (happy path) or boot logged-but-empty
+  // (RPC unreachable; the MM declines-to-quote until self-heal). Either
+  // way, no per-intent RPC latency.
+  const referencePair: ReferencePair = {
+    tokenIn: env.knownTokens.weth.address,
+    tokenOut: env.knownTokens.usdc.address,
+    decimalsIn: env.knownTokens.weth.decimals,
+    decimalsOut: env.knownTokens.usdc.decimals,
+  };
+  const reference = createUniswapReference({
+    client: wallet.publicClient,
+    chainId: env.chainId,
+    pair: referencePair,
+    refreshIntervalMs: env.priceRefreshIntervalMs,
+    log,
+  });
+  await reference.start();
+
   // Active negotiations and chain submissions, keyed by offer id.
   const pending = new Map<string, PendingDeal>();
 
@@ -229,7 +262,17 @@ async function main(): Promise<void> {
       if (inbox) {
         const msg = parseMessage(inbox.body);
         if (msg) {
-          await dispatch(msg, inbox.fromPeerId, cfg, wallet, axl, pending);
+          await dispatch(
+            msg,
+            inbox.fromPeerId,
+            cfg,
+            wallet,
+            axl,
+            pending,
+            reference,
+            referencePair,
+            env.priceMaxStaleMs,
+          );
         } else {
           log({ event: "unparsable_message" });
         }
@@ -253,11 +296,24 @@ async function dispatch(
   wallet: MmWallet,
   axl: AxlClient,
   pending: Map<string, PendingDeal>,
+  reference: UniswapReference,
+  referencePair: ReferencePair,
+  priceMaxStaleMs: number,
 ): Promise<void> {
   try {
     switch (msg.type) {
       case "intent.broadcast":
-        await handleIntent(msg, fromPeerId, cfg, wallet, axl, pending);
+        await handleIntent(
+          msg,
+          fromPeerId,
+          cfg,
+          wallet,
+          axl,
+          pending,
+          reference,
+          referencePair,
+          priceMaxStaleMs,
+        );
         break;
       case "offer.accept":
         handleAccept(msg, cfg, pending);
@@ -277,6 +333,9 @@ async function handleIntent(
   wallet: MmWallet,
   axl: AxlClient,
   pending: Map<string, PendingDeal>,
+  reference: UniswapReference,
+  referencePair: ReferencePair,
+  priceMaxStaleMs: number,
 ): Promise<void> {
   log({
     event: "intent_received",
@@ -285,6 +344,25 @@ async function handleIntent(
     from_header: fromPeerId,
     from_field: intent.from_axl_pubkey,
   });
+
+  // Synchronous cache read — no RPC on the intent path. If the background
+  // refresher hasn't produced a value yet (RPC unreachable at boot) or
+  // the cached value has aged past the staleness gate, we DECLINE to
+  // quote rather than emit a stale price. The User Agent's existing
+  // "fewer offers than expected → fall through to Uniswap fallback"
+  // flow handles silence cleanly.
+  const cached = reference.read(referencePair);
+  const cacheAge = cached ? Date.now() - cached.fetchedAt : null;
+  if (cached === null || cacheAge === null || cacheAge > priceMaxStaleMs) {
+    log({
+      event: "offer_declined",
+      reason: "price_unavailable",
+      intent_id: intent.id,
+      cache_age_ms: cacheAge,
+      max_stale_ms: priceMaxStaleMs,
+    });
+    return;
+  }
 
   // Live chain read — the source of truth for what we actually have to trade.
   // Decouples quoting decisions from any env-driven cap so a cold restart
@@ -295,7 +373,7 @@ async function handleIntent(
     cfg.knownTokens,
   );
 
-  const prepared = buildOffer(intent, inventory, cfg);
+  const prepared = buildOffer(intent, inventory, cached.value, cfg);
   if (!prepared) {
     log({
       event: "intent_skipped",

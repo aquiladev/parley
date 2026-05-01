@@ -279,6 +279,38 @@ This phase is grounded in `deployment.md`, the working document that tracks depl
  
 ---
 
+## Phase 8 — MM Agent live reference pricing
+
+**Estimate:** 0.5–1 day
+**Tester readiness:** same as Phase 6 — quotes that actually track the market
+
+**Goal:** replace the Phase-1 hardcoded `3000 USDC/WETH` reference constant with a live Uniswap v3 mid-price refreshed in the background. MM quotes track real Sepolia market state; the intent-handling path stays synchronous (no RPC inline) by reading from an in-memory cache. If the cache is empty or stale, the MM declines to quote rather than emit a mispriced offer.
+
+**Outcomes:**
+
+- [x] New `packages/mm-agent/src/uniswap-reference.ts` module: `setInterval`-driven background loop fetches the Sepolia QuoterV2 mid-price for the configured pair, probes all standard v3 fee tiers, picks the best route, and writes to an in-memory cache with a `fetchedAt` timestamp. Reuses the fee-tier-probe pattern from `packages/user-agent/mcps/og-mcp/src/uniswap.ts`.
+- [x] Hardcoded `PHASE1_REFERENCE_TWAP_USDC_PER_WETH_1E18` removed from `packages/mm-agent/src/pricing.ts`. The reference now flows in from the caller via a `referenceTwap1e18: bigint` parameter on `buildOffer`.
+- [x] `handleIntent` in `packages/mm-agent/src/index.ts` reads the cached price synchronously — zero added RPC latency on the intent path. If the cached value is older than `MM_PRICE_MAX_STALE_MS` (or the cache is empty), the MM logs `offer_declined`, `reason: "price_unavailable"` and emits no AXL message. The User Agent's existing "fewer offers than expected → Uniswap fallback" flow handles silence gracefully — no User-Agent-side change needed.
+- [x] Two new env vars (with sensible defaults) on the MM Agent:
+  - `MM_PRICE_REFRESH_INTERVAL_MS` (default `15000`) — background refresh cadence
+  - `MM_PRICE_MAX_STALE_MS` (default `60000`) — hard staleness gate
+- [x] Resilience: on RPC failure during a refresh, the cache keeps the prior value (last-good wins until age-out). After 5 consecutive failures, a single `price_refresh_chronic_failure` log is emitted at WARN. The MM self-heals once RPC is back without restart.
+- [x] Boot path: `start()` performs the first fetch synchronously so a healthy MM begins accepting intents with a warm cache. If the first fetch fails (RPC unreachable at boot), the MM continues running in decline-to-quote mode until the next successful refresh — no `process.exit(1)`, no operator intervention required.
+
+**Verification:**
+
+- [ ] **Boot waits for first fetch.** `make logs-prod` shows `price_refresh_initial_ok` with a value before the first `intent_received`.
+- [ ] **Quotes track real prices.** Send a swap intent. Offer's quoted price is near live Uniswap reference (~2000–2500 USDC/WETH today, not the old 3000 stub). Cross-check against `mcp_parley_og_get_uniswap_reference_quote` on the User Agent side — the two reference prices agree within ~5 bps modulo fetch-time skew.
+- [ ] **Intent path is sync.** No new RPC happens during `handleIntent` — log timestamps confirm the lookup is in-memory.
+- [ ] **Decline-to-quote on stale cache.** With `MM_PRICE_MAX_STALE_MS=1` (force every read to look stale), the MM logs `offer_declined`, `reason: "price_unavailable"` and sends no offer.
+- [ ] **RPC outage at boot self-heals.** With a bogus `SEPOLIA_RPC_URL`, MM boots, logs `price_refresh_initial_failed`, declines all intents. Restore RPC; the next 15s tick succeeds and the MM begins quoting without restart.
+- [ ] **Two MMs read the same pool.** Both `mm-agent` and `mm-agent-2` quote prices that differ by exactly `MM_SPREAD_BPS - MM2_SPREAD_BPS` modulo TWAP-fetch skew.
+- [ ] **Graceful shutdown.** `make down-prod` cleans up cleanly; no setInterval-related leaks.
+
+**Demoable state:** MM offers reflect live market state. A Sepolia ETH price move shows up in the next quote within 15s. Operator confidence — quotes that mispriced by 20%+ in Phase 7 are now anchored to reality, and a chronic RPC outage produces a clean "no offer from this MM" rather than a mispriced offer.
+
+---
+
 ## Risk register
 
 Things that could derail the build, with mitigations. Listed in approximate order of "this is the one I'd be most worried about."
