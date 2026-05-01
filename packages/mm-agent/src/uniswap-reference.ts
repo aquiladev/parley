@@ -54,6 +54,30 @@ function probeAmountFor(decimalsIn: number): bigint {
   return 10n ** BigInt(decimalsIn) / 10n;
 }
 
+// Uniswap v3 fee tiers are denominated in hundredths of a basis point
+// (1e6 == 100%). 3000 = 0.3%, 500 = 0.05%, etc. Used by stripPoolFee.
+const FEE_DENOMINATOR = 1_000_000n;
+
+/** Reverse the LP fee that QuoterV2's `amountOut` already deducted, so the
+ *  MM's reference approximates the no-fee mid-price.
+ *
+ *  Why: QuoterV2 simulates a real swap — Uniswap v3 takes the fee off the
+ *  input before the swap curve runs, so the returned `amountOut` is the
+ *  fee-paying user's net. For peer-to-peer MM pricing the fee is
+ *  irrelevant (no LP is involved); spreading off the fee-paid number
+ *  would tilt the MM's quote by the fee tier each direction.
+ *
+ *  Math: `amountOut = curve(amountIn × (1 − fee/1e6))`. For small probes
+ *  where the curve is locally linear, `amountOut_nofee ≈ amountOut /
+ *  (1 − fee/1e6) = amountOut × 1e6 / (1e6 − fee)`. Exact in deep pools;
+ *  sub-bps error in our 0.1 WETH probe on any Sepolia pool with usable
+ *  liquidity. If sub-bps precision ever matters, switch to a direct
+ *  `pool.slot0()` read of `sqrtPriceX96` for the true zero-trade mid.
+ */
+function stripPoolFee(amountOut: bigint, feeTier: number): bigint {
+  return (amountOut * FEE_DENOMINATOR) / (FEE_DENOMINATOR - BigInt(feeTier));
+}
+
 const CHRONIC_FAILURE_THRESHOLD = 5;
 
 export interface ReferencePair {
@@ -228,8 +252,10 @@ export function createUniswapReference(
         return;
       }
       const probeIn = probeAmountFor(args.pair.decimalsIn);
+      // Strip the LP fee BEFORE scaling — see stripPoolFee comment.
+      const amountOutNoFee = stripPoolFee(best.amountOut, best.feeTier);
       const value = scaleToReference1e18(
-        best.amountOut,
+        amountOutNoFee,
         probeIn,
         args.pair.decimalsIn,
         args.pair.decimalsOut,
@@ -245,6 +271,8 @@ export function createUniswapReference(
         event: "price_refresh_ok",
         pair: k,
         value: value.toString(),
+        amount_out_with_fee: best.amountOut.toString(),
+        amount_out_no_fee: amountOutNoFee.toString(),
         fee_tier: best.feeTier,
       });
     } catch (err) {
