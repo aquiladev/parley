@@ -121,6 +121,10 @@ services:
         NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID: ${NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID}
         NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS: ${NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS}
         NEXT_PUBLIC_CHAIN_ID: ${NEXT_PUBLIC_CHAIN_ID:-11155111}
+        # The wagmi transport URL. Same paid endpoint the agents use; without
+        # this the wallet-side gas estimation falls back to public Sepolia
+        # and "Network or RPC error" fires on every confirmation.
+        NEXT_PUBLIC_SEPOLIA_RPC_URL: ${SEPOLIA_RPC_URL}
     env_file:
       - .env
     environment:

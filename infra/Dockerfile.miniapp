@@ -41,9 +41,15 @@ COPY artifacts        artifacts
 ARG NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID
 ARG NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS
 ARG NEXT_PUBLIC_CHAIN_ID=11155111
+# Sepolia RPC for the wagmi transport (gas estimation, nonce fetch, chain-id
+# check pre-tx). Without this, viem's http() falls back to a public default
+# that rate-limits and surfaces "Network or RPC error" on every confirmation.
+# Use the same paid endpoint the agents read from SEPOLIA_RPC_URL.
+ARG NEXT_PUBLIC_SEPOLIA_RPC_URL
 ENV NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID=${NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID} \
     NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS=${NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS} \
-    NEXT_PUBLIC_CHAIN_ID=${NEXT_PUBLIC_CHAIN_ID}
+    NEXT_PUBLIC_CHAIN_ID=${NEXT_PUBLIC_CHAIN_ID} \
+    NEXT_PUBLIC_SEPOLIA_RPC_URL=${NEXT_PUBLIC_SEPOLIA_RPC_URL}
 
 # Logo + favicon mirror from /artifacts/. Skipping this ships stale icons —
 # Phase 6a requires the build to catch this, hence the explicit step.
