@@ -21,6 +21,106 @@ https://github.com/user-attachments/assets/1454da20-ed7a-4cea-bfa7-a44a066da926
 
 A user broadcasts an intent over [Gensyn AXL](https://github.com/gensyn-ai/axl); a market-maker agent prices it deterministically and signs an EIP-712 offer; both sides lock collateral in `Settlement.sol`; `settle()` transfers atomically. No LLM in the MM pricing path; no broker; user funds never leave the user's wallet except into the settlement contract.
 
+## Try it on Sepolia
+
+A live testnet deployment is running. **Bot:** [`@x5ar1ey_bot`](https://t.me/x5ar1ey_bot) on Telegram.
+
+### Prerequisites
+
+- **Telegram** (any version — mobile, desktop, or web).
+- **A WalletConnect-compatible wallet.** MetaMask mobile, Rabby, Trust, Coinbase Wallet, Phantom, or any other wallet supporting WalletConnect v2 works. Inside the Telegram in-app browser, only WalletConnect deep-links work — browser-extension wallets aren't reachable from the Telegram webview, so a separate wallet app on your phone is the path of least resistance.
+- **Sepolia ETH** for gas — [sepoliafaucet.com](https://sepoliafaucet.com), [alchemy.com/faucets/ethereum-sepolia](https://www.alchemy.com/faucets/ethereum-sepolia), or [cloud.google.com/application/web3/faucet/ethereum/sepolia](https://cloud.google.com/application/web3/faucet/ethereum/sepolia). Around `0.05 ETH` is more than enough for several trades.
+- **Sepolia USDC and/or WETH.** Get USDC from Circle's testnet faucet at [faucet.circle.com](https://faucet.circle.com) (select Ethereum Sepolia, paste your address, claim 10 USDC). Get WETH by wrapping a tiny bit of ETH at the Sepolia WETH contract [`0xfFf9…6B14`](https://sepolia.etherscan.io/address/0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14#writeContract) — call `deposit()` with a small `payable` value (e.g., `0.002 ETH`).
+
+### Walk-through
+
+> **A note on commands.** The Parley commands below (`connect`, `balance`, `history`, `policy`, `cancel`, `logout`, `reset`, `help`) are typed **without a leading slash** — they're conversational triggers the agent recognizes from natural language, not Telegram bot commands. If you start a message with `/`, Hermes (the agent runtime) will reply with *"Unknown command"* before the LLM ever sees it. The only `/`-prefixed commands are Hermes' built-ins (`/start`, `/commands`).
+
+**1. Connect wallet.** Open Telegram, search [`@x5ar1ey_bot`](https://t.me/x5ar1ey_bot), tap *Start*. Type `connect` (or just say what you want to do — *"swap 5 USDC to ETH"* — and the bot will prompt for connect first). The bot replies with a *Connect wallet* button.
+
+> **Tap the button inside Telegram** — don't long-press → *Open in Browser*. The Mini App needs Telegram's `WebApp` runtime to relay your signature back to the bot. Outside of Telegram, the relay channel is broken.
+
+In the Mini App, pick **WalletConnect**, scan the QR with your wallet (or tap a wallet name on mobile to deep-link), approve the session. You'll be asked to sign a small message — that's the **session binding** (proves you control the wallet you just connected; valid 24h). The bot acknowledges with your address.
+
+**2. Issue an intent.** Type a swap in plain language:
+
+```
+swap 5 USDC for ETH
+swap 0.001 ETH for USDC
+```
+
+The bot:
+- Builds an Intent (your swap parameters as a structured object) and shows you the parameters
+- Asks you to **authorize the intent** — another tap, another EIP-712 signature inside the Mini App. This binds your intent to your session so the privileged tools (broadcast, accept, write-trade-record per [SPEC §4.3](SPEC.md)) will accept it.
+- Broadcasts to all known MMs over the Gensyn AXL mesh and waits up to ~60s for offers.
+
+**3. Pick an offer.** You'll see one Telegram message titled *"💱 Received N offers in T s"* with a row per MM:
+
+```
+⭐ Accept mm-1.parley.eth · 0.0033 ETH · saves 0.42% · rep 0.85
+   Accept mm-2.parley.eth · 0.0032 ETH · saves 0.10% · rep 0.71
+```
+
+The top row (⭐) is the recommended pick — sorted by output amount, most-output-to-you wins. Reputation is shown on each row for transparency but does NOT affect ranking; `policy.min_counterparty_rep` is a floor that drops below-threshold MMs, not a weight. Offers worse than Uniswap render as `⚠ X.XX% worse than Uniswap` instead of `saves X.XX%`.
+
+Tap any row → the **Sign** Mini App opens. Three things happen:
+
+1. **Sign the Deal** (EIP-712) — the canonical settlement terms (tokens, amounts, deadline, nonce). This is what the contract checks at lock + settle time.
+2. **Sign the Accept Authorization** (EIP-712) — auth for your agent to send the Accept message to the MM on your behalf.
+3. **Submit `lockUserSide` tx** — your wallet pops up to confirm. This is the **only on-chain transaction you submit yourself** for this trade. It pulls `tokenA` (the input you're selling) into the Settlement contract.
+
+If your wallet asks for an `approve` first because you've never spent that token from this address, do that before the lock — the Mini App handles the prompt.
+
+**4. Settle.** Wait ~10–30s. The MM Agent watches the chain, sees `UserLocked`, submits its own `lockMMSide` tx, and the chain transitions to `BothLocked`. The bot polls Settlement state and once it sees `BothLocked` it sends a *Settle* button. Tap → submit `settle()` from the Mini App → atomic swap. You receive your output token; the MM receives the input.
+
+The bot reports the settlement tx hash. Click through to Sepolia Etherscan — you can verify that `Settled(bytes32 indexed dealHash)` was emitted by the contract at [`0xE5e7…E219`](https://sepolia.etherscan.io/address/0xE5e766d8fEdd8705d537D0016f1A2bff852fE219).
+
+**5. Verify.** Type `balance` to see your updated USDC + WETH + ETH. Type `history` to see the trade in your reputation history.
+
+### Other commands worth trying
+
+Type these as plain words — **no leading slash**.
+
+| Command | What it does |
+|---|---|
+| `help` | Full command reference |
+| `balance` | Wallet balances on Sepolia (ETH, USDC, WETH) |
+| `history` | Your past trades + reputation score |
+| `policy` | Adjust min counterparty rep, max slippage, intent timeout |
+| `cancel` | Cancel an in-flight intent before signing |
+| `logout` | Wipe session binding (you'll need to `connect` again) |
+| `reset` | Clear conversation context |
+
+### Edge cases worth poking at
+
+- **Cancel an intent mid-flight.** Type `cancel` while the bot is *Collecting offers…*. State should clear cleanly; nothing on-chain happens.
+- **No peer offer beats Uniswap.** Try a very small or very large swap so the MMs' spread underperforms the Uniswap reference. The bot should offer a direct Uniswap v3 fallback swap (`QuoterV2` + `SwapRouter02` on Sepolia) instead.
+- **Refund.** Lock `tokenA` and then never tap *Settle*. After the deal deadline (~5 min), the bot should surface a *Refund* button. Tap it to recover your locked funds. (Hard to trigger reliably because the MM auto-locks fast; mainly useful for reading the contract's `refund` path.)
+- **Multiple intents in parallel.** Issue a second swap while the first is mid-settlement. Each deal lives in its own Settlement storage slot; concurrent deals can't interfere with each other.
+
+### If something breaks
+
+| Symptom | Likely cause |
+|---|---|
+| *"Wrong network — switch your wallet to Sepolia."* | Wallet is on a different chain. Switch to chain ID 11155111. |
+| *"Insufficient balance to cover gas or the transfer amount."* | Need more Sepolia ETH (gas) or more of the input token. |
+| *"Token allowance is too low. Approve the contract and try again."* | First time spending this token; the Mini App will prompt an `approve` tx. |
+| *"Network or RPC error. Try again in a moment."* | Sepolia RPC blip; retry. If persistent, the deployment may be using an unhealthy RPC. |
+| Mini App opens in your phone's browser instead of Telegram | You hit *Open in browser* on the long-press. Close it, retap the bot's button — Telegram's `WebApp` runtime is required for the relay round-trip. |
+| *"Unknown command. Type /commands…"* | You started a message with `/`. The Parley triggers (`connect`, `balance`, etc.) are typed without the leading slash; only Hermes' built-ins (`/start`, `/commands`) use one. |
+| Bot doesn't respond | Session may have expired. Type `connect` to refresh. If the bot remains silent, the deployment may be down. |
+
+### What this proves
+
+Walking through the flow above exercises every load-bearing piece of the protocol:
+
+- **Asymmetric submission**: the User Agent sent zero transactions; everything user-side came from your wallet.
+- **EIP-712 binding**: the same `dealHash` was signed by both parties, validated by the contract, and used as the storage key.
+- **AXL mesh transport**: your intent reached two independently-running MM containers without any central broker.
+- **ENS-resolved identity**: each MM's offer was verified by resolving its ENS subname's `addr` + `axl_pubkey` text records and checking that the AXL sender + EIP-712 signer matched.
+- **0G-anchored reputation**: a `TradeRecord` blob was written to 0G Storage and indexed against both your wallet and the MM's ENS name; future `/history` calls fetch and verify it via Merkle proof.
+- **Atomic settlement**: `settle()` swapped both sides in a single contract call; no party could rug the other.
+
 ## How it works
 
 - **Settlement** — single Solidity contract, two-sided lock + atomic swap, EIP-712 signed deals. Deployed at [`0xE5e7…E219`](https://sepolia.etherscan.io/address/0xE5e766d8fEdd8705d537D0016f1A2bff852fE219) on Sepolia. Source: `packages/contracts/`.
