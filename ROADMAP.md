@@ -207,26 +207,31 @@ This phase is grounded in `deployment.md`, the working document that tracks depl
 **Goal:** the stack runs on a remote server, addressable via a stable HTTPS hostname for the Mini App, with the operational substrate in place to keep it running unattended.
  
 **Outcomes:**
- 
-- [ ] Stable HTTPS hostname for the Mini App, with a Caddy (or equivalent) reverse proxy in front and automatic Let's Encrypt TLS. The hostname is added to:
-  - WalletConnect Cloud's project domain allowlist
-  - Telegram BotFather (`/setdomain` and the `web_app` URL on the bot's menu button)
-- [ ] AXL nodes configured to reach existing public Gensyn AXL peers (NAT'd is fine for the demo per `deployment.md` §9).
-- [ ] ENS subnames registered on Sepolia: `mm-N.parley.eth` minted via the registration script, with `addr`, `axl_pubkey`, and `agent_capabilities` text records set.
+
+- [x] Stable HTTPS hostname for the Mini App, fronted by an existing Traefik instance with automatic Let's Encrypt TLS. Standalone `compose.prod.yml` (Traefik labels + external network attachment, no host port bindings). The hostname is added to:
+  - [x] WalletConnect Cloud's project domain allowlist (verified — wallet connection succeeds in prod)
+  - [x] Telegram BotFather (`/setdomain` and the `web_app` URL on the bot's menu button)
+- [x] AXL nodes configured to reach existing public Gensyn AXL peers (the user-agent and both MM nodes peer with `34.46.48.224` and `136.111.135.206` per `infra/axl/node-config.*.json`).
+- [x] ENS subnames registered on Sepolia: `mm-1.parley.eth` and `mm-2.parley.eth` are both live with `addr`, `axl_pubkey`, and `agent_capabilities` text records (Phase 7 work).
 - [ ] Multi-user isolation verified under realistic load: two test Telegram accounts simultaneously, distinct sessions, no context leakage. This is the gate before opening the bot to anyone outside the team — see `deployment.md` §8.
-- [ ] Hermes pairing re-enabled in production (or `TELEGRAM_ALLOWED_USERS` curated explicitly). The dev-time `unauthorized_dm_behavior: ignore` setting is reversed.
-- [ ] The external-configuration runbook from `deployment.md` §6 walked through deliberately: WalletConnect allowlist, BotFather setup, bot avatar uploaded, ENS records confirmed, Sepolia funding for the MM hot wallet, GitHub social preview image set.
-- [ ] Backups in place for the truly non-recreatable state: both `axl.pem` files and the deployer wallet private key, stored cold and externally to the host.
+- [ ] Hermes pairing re-enabled in production (or `TELEGRAM_ALLOWED_USERS` curated explicitly). The dev-time `GATEWAY_ALLOW_ALL_USERS=true` setting is reversed.
+- [ ] The external-configuration runbook from `deployment.md` §6 walked through deliberately: WalletConnect allowlist ✓, BotFather setup ✓, bot avatar uploaded, ENS records confirmed ✓, Sepolia funding for both MM hot wallets ✓, GitHub social preview image set.
+- [ ] Backups in place for the truly non-recreatable state: all three `axl.pem` files (user-agent, mm-agent, mm-agent-2) and the deployer wallet private keys, stored cold and externally to the host.
 - [ ] Rotation runbooks drafted (not necessarily exercised) for: `MM_EVM_PRIVATE_KEY` (drain → redeploy with new key → update ENS `addr` → restart) and `axl.pem` (new key → re-register `axl_pubkey` text record → restart).
 - [ ] NTP confirmed running on the host. EIP-712 deadlines depend on accurate clocks.
-- [ ] Logging committed to a destination — at minimum, JSON to stdout with `docker logs` reachable. An aggregator is welcome but not required.
+- [x] Logging committed to a destination — JSON to stdout reachable via `make logs-prod` / `docker compose -f compose.prod.yml logs`. Aggregator deferred.
+
+**Phase 6b infrastructure shipped during the deploy that wasn't in the original outcome list:**
+
+- [x] Permission shim for `infra/state/*/axl.pem`: macOS Docker Desktop transparently remaps host UIDs, but Linux preserves them — so the operator must `sudo chown -R 10001:10001 infra/state/` once after `make axl-keys` so the bind-mounted PEMs are readable by the container's `parley` user (uid 10001). Documented in deployment runbook.
+- [x] Wallet-side Sepolia RPC URL wired through the miniapp build (`NEXT_PUBLIC_SEPOLIA_RPC_URL`): without this, viem's wagmi transport falls back to a public Sepolia default, rate-limits, and surfaces "Network or RPC error" on every `lockUserSide` confirmation. Now baked into the miniapp client bundle from the same paid endpoint the agents use.
 
 **Verification before declaring 6b complete:**
 
-- [ ] The bot is reachable on Telegram via its production handle
-- [ ] The Mini App loads at the production HTTPS hostname
-- [ ] A trade completes end-to-end with the developer's own wallet, on the deployed instance
-- [ ] Two test Telegram users, simultaneous sessions, isolation holds (no context leakage between sessions)
+- [x] The bot is reachable on Telegram via its production handle
+- [x] The Mini App loads at the production HTTPS hostname
+- [x] A trade completes end-to-end with the developer's own wallet, on the deployed instance (verified after the wagmi RPC fix landed)
+- [ ] Two test Telegram users, simultaneous sessions, isolation holds (no context leakage between sessions) — the security gate before opening to outside testers
 - [ ] `docker compose restart user-agent` preserves all in-flight state
 **Demoable state (6b):** Parley running on a server, addressable by anyone with the bot's Telegram handle. Self-hostable. Operationally honest — backups, monitoring, isolation verified.
  

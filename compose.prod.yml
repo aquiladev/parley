@@ -22,9 +22,12 @@
 # DNS-01 with Cloudflare API tokens.
 #
 # Per-server tweaks (in .env on the server, NOT committed):
-#   MINIAPP_HOST            e.g. parley-miniapp.b11a.xyz
+#   MINIAPP_HOST            REQUIRED. The public hostname Traefik routes
+#                           the Mini App at. compose.prod.yml refuses to
+#                           render if unset.
 #   TRAEFIK_NETWORK         the external network Traefik attaches to
-#                           (`docker network ls`; e.g. traefik-public)
+#                           (`docker network ls`; commonly `traefik`,
+#                            `traefik-public`, `proxy`, `web`).
 #   TRAEFIK_ENTRYPOINT      HTTPS entrypoint name in traefik.yml
 #                           (commonly `websecure`)
 #   TRAEFIK_CERTRESOLVER    cert resolver name in traefik.yml
@@ -123,7 +126,7 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik-public}"
-      - "traefik.http.routers.parley-miniapp.rule=Host(`${MINIAPP_HOST:-parley-miniapp.b11a.xyz}`)"
+      - "traefik.http.routers.parley-miniapp.rule=Host(`${MINIAPP_HOST:?MINIAPP_HOST must be set in .env (the public hostname Traefik routes the Mini App at)}`)"
       - "traefik.http.routers.parley-miniapp.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
       - "traefik.http.routers.parley-miniapp.tls=true"
       - "traefik.http.routers.parley-miniapp.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"

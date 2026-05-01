@@ -134,7 +134,7 @@ The read code path is `og-mcp.read_mm_reputation` / `read_user_reputation`; the 
 | 4 | Reputation, refunds, observability | ✅ done |
 | 5 | Uniswap fallback + polish | ✅ done |
 | 6a | Containerized deployment (local Docker stack) | ✅ done |
-| 6b | Single-VPS deployment | ⏭ planned |
+| 6b | Single-VPS deployment | 🚧 infra live; security gate pending |
 | 7 | Second MM Agent + competitive offer cards | ✅ done |
 
 ## Running it
