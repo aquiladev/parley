@@ -9,6 +9,12 @@
 
 ## Demo
 
+**Phase 7 — competing market makers on the same intent.** *(Telegram + Mini App + two MM Agents quoting in parallel.)*
+
+[![Phase 7 demo](https://img.youtube.com/vi/b-EQMxKtrlA/maxresdefault.jpg)](https://youtu.be/b-EQMxKtrlA)
+
+A user types `swap 50 USDC for ETH` into the bot. Two MM Agents (`mm-1.parley.eth` and `mm-2.parley.eth`) price the intent independently and reply with EIP-712-signed offers. The User Agent ranks them, surfaces a single Telegram card with both options side-by-side (each row shows reputation, output amount, and the "vs Uniswap" delta), and the user picks one with a tap. The picked offer flows through atomic two-sided lock + settle on Sepolia; the unpicked one expires cleanly.
+
 **Phase 1 — terminal-only end-to-end trade on Sepolia.** *(Architectural spine; Phase 2 layered on the Telegram + Mini App user surface.)*
 
 https://github.com/user-attachments/assets/1454da20-ed7a-4cea-bfa7-a44a066da926

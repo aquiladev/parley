@@ -12,11 +12,12 @@ USER_PEM := $(INFRA_STATE)/user-agent/axl.pem
 MM_PEM   := $(INFRA_STATE)/mm-agent/axl.pem
 MM2_PEM  := $(INFRA_STATE)/mm-agent-2/axl.pem
 
-.PHONY: help deploy-local up down logs build axl-keys clean check-env
+.PHONY: help deploy-local deploy-prod up up-prod down down-prod logs logs-prod build build-prod axl-keys clean check-env
 
 help:
-	@echo "Parley — local Docker workflow"
+	@echo "Parley — Docker workflow"
 	@echo ""
+	@echo "Local (developer laptop):"
 	@echo "  make axl-keys       Generate ed25519 PEMs for both agents (idempotent)"
 	@echo "  make build          docker compose build (no up)"
 	@echo "  make deploy-local   axl-keys + build + up -d"
@@ -25,7 +26,15 @@ help:
 	@echo "  make logs           docker compose logs -f"
 	@echo "  make clean          down + remove built images + volumes"
 	@echo ""
+	@echo "Production (single VPS behind Traefik — Phase 6b):"
+	@echo "  make deploy-prod    axl-keys + build-prod + up-prod"
+	@echo "  make build-prod     docker compose -f compose.yml -f compose.prod.yml build"
+	@echo "  make up-prod        docker compose -f compose.yml -f compose.prod.yml up -d"
+	@echo "  make down-prod      docker compose -f compose.yml -f compose.prod.yml down"
+	@echo "  make logs-prod      docker compose -f compose.yml -f compose.prod.yml logs -f"
+	@echo ""
 	@echo "Prereqs: a populated .env at the repo root (see .env.example)."
+	@echo "Production additionally needs MINIAPP_HOST + TRAEFIK_* env vars set."
 
 # `deploy-local` is the headline target — fresh checkout to running stack.
 # Order matters: keys must exist before the entrypoints will start.
@@ -86,6 +95,28 @@ down:
 
 logs:
 	docker compose logs -f
+
+# Production overlay: layers compose.prod.yml on top of compose.yml.
+# Removes the miniapp's host port binding and wires Traefik labels for
+# HTTPS routing through your existing Traefik instance.
+PROD_COMPOSE := -f compose.yml -f compose.prod.yml
+
+deploy-prod: check-env axl-keys build-prod up-prod
+	@echo ""
+	@echo "Stack up. Tail logs with: make logs-prod"
+	@echo "Mini App should resolve at https://$${MINIAPP_HOST:-parley-miniapp.b11a.xyz} once Traefik issues the cert."
+
+build-prod:
+	docker compose $(PROD_COMPOSE) build
+
+up-prod:
+	docker compose $(PROD_COMPOSE) up -d
+
+down-prod:
+	docker compose $(PROD_COMPOSE) down
+
+logs-prod:
+	docker compose $(PROD_COMPOSE) logs -f
 
 clean:
 	docker compose down --volumes --remove-orphans
