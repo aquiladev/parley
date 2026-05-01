@@ -1,42 +1,116 @@
-# Phase 6b: production overlay. Layered on top of compose.yml.
+# Phase 6b: production stack — standalone (NOT layered on compose.yml).
 #
-# Usage:
-#   docker compose -f compose.yml -f compose.prod.yml up -d --build
+# Bring-up:
+#   docker compose -f compose.prod.yml up -d --build
 #   (or `make deploy-prod`)
 #
-# What this overlay does:
-#   - Removes the miniapp's `ports: 3000:3000` host binding so the service
-#     is no longer directly internet-exposed. Traefik reaches it over the
-#     shared external docker network.
-#   - Wires Traefik labels onto miniapp for HTTPS routing + automatic
-#     TLS via the configured cert resolver.
-#   - Tightens the user-agent and mm-agent host bindings to 127.0.0.1
-#     (already that way in compose.yml; reasserted here for clarity).
+# Differences from compose.yml (the dev stack):
+#   - No host port bindings on user-agent / mm-agent / mm-agent-2 / miniapp.
+#     Inter-service traffic flows over the internal `default` docker network;
+#     external traffic to miniapp arrives via Traefik on the shared
+#     `${TRAEFIK_NETWORK}` network.
+#   - miniapp is attached to `${TRAEFIK_NETWORK}` (external) and labelled for
+#     HTTPS routing through your existing Traefik instance.
 #
-# Per-server tweaks (set in .env on the server, NOT committed):
+# Keep this in step with compose.yml for everything else (build context,
+# env_file, healthchecks, volumes, depends_on). When you change one, update
+# the other.
+#
+# Cloudflare DNS gotcha: if `${MINIAPP_HOST}` is PROXIED (orange cloud),
+# Let's Encrypt's HTTP-01 challenge through Traefik will fail. Use DNS-only
+# (grey cloud) for first cert issuance, or switch Traefik's resolver to
+# DNS-01 with Cloudflare API tokens.
+#
+# Per-server tweaks (in .env on the server, NOT committed):
 #   MINIAPP_HOST            e.g. parley-miniapp.b11a.xyz
-#   TRAEFIK_NETWORK         the external docker network Traefik attaches to
-#                           (`docker network ls` on the host; commonly
-#                            `traefik`, `proxy`, `web`, etc.)
-#   TRAEFIK_ENTRYPOINT      the HTTPS entrypoint name in your traefik.yml
-#                           (commonly `websecure` or `https`)
-#   TRAEFIK_CERTRESOLVER    the ACME / cert resolver name in traefik.yml
-#                           (commonly `letsencrypt`, `myresolver`,
-#                            `cloudflare` if using DNS-01)
-#
-# Cloudflare DNS gotcha: if `parley-miniapp.b11a.xyz` is set to PROXIED
-# (orange cloud) in Cloudflare, Let's Encrypt's HTTP-01 challenge through
-# Traefik will fail because Cloudflare terminates TLS upstream. Either set
-# the record to DNS-only (grey cloud) for cert issuance, or switch
-# Traefik's resolver to DNS-01 with Cloudflare API tokens.
+#   TRAEFIK_NETWORK         the external network Traefik attaches to
+#                           (`docker network ls`; e.g. traefik-public)
+#   TRAEFIK_ENTRYPOINT      HTTPS entrypoint name in traefik.yml
+#                           (commonly `websecure`)
+#   TRAEFIK_CERTRESOLVER    cert resolver name in traefik.yml
+#                           (commonly `letsencrypt`)
+
+name: parley
+
+x-mm-agent-base: &mm-agent-base
+  build:
+    context: .
+    dockerfile: infra/Dockerfile.mm-agent
+  env_file:
+    - .env
+  depends_on:
+    user-agent:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/topology >/dev/null 2>&1 || exit 1"]
+    interval: 10s
+    timeout: 3s
+    retries: 6
+    start_period: 30s
+  restart: unless-stopped
 
 services:
 
+  user-agent:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.user-agent
+    env_file:
+      - .env
+    environment:
+      AXL_HTTP_URL: http://127.0.0.1:9002
+      AXL_PRIVATE_KEY_PATH: /run/parley/axl.pem
+      MM_EVM_PRIVATE_KEY: ""
+    volumes:
+      - ./infra/state/user-agent/axl.pem:/run/parley/axl.pem:ro
+      - hermes_state:/home/parley/.hermes
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/topology >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+
+  mm-agent:
+    <<: *mm-agent-base
+    environment:
+      AXL_HTTP_URL: http://127.0.0.1:9002
+      AXL_PRIVATE_KEY_PATH: /run/parley/axl.pem
+      TELEGRAM_BOT_TOKEN: ""
+      ANTHROPIC_API_KEY: ""
+    volumes:
+      - ./infra/state/mm-agent/axl.pem:/run/parley/axl.pem:ro
+
+  mm-agent-2:
+    <<: *mm-agent-base
+    environment:
+      AXL_HTTP_URL: http://127.0.0.1:9002
+      AXL_PRIVATE_KEY_PATH: /run/parley/axl.pem
+      TELEGRAM_BOT_TOKEN: ""
+      ANTHROPIC_API_KEY: ""
+      MM_EVM_PRIVATE_KEY: "${MM2_EVM_PRIVATE_KEY:-}"
+      MM_ENS_NAME: "${MM2_ENS_NAME:-mm-2.parley.eth}"
+      MM_SPREAD_BPS: "${MM2_SPREAD_BPS:-30}"
+    volumes:
+      - ./infra/state/mm-agent-2/axl.pem:/run/parley/axl.pem:ro
+
   miniapp:
-    # Remove the 3000:3000 host binding from compose.yml. With docker
-    # compose's deep-merge, declaring `ports: []` here replaces the parent
-    # list entirely.
-    ports: []
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.miniapp
+      args:
+        NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID: ${NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID}
+        NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS: ${NEXT_PUBLIC_SETTLEMENT_CONTRACT_ADDRESS}
+        NEXT_PUBLIC_CHAIN_ID: ${NEXT_PUBLIC_CHAIN_ID:-11155111}
+    env_file:
+      - .env
+    environment:
+      MM_EVM_PRIVATE_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      ZG_COMPUTE_KEY: ""
+      OG_PRIVATE_KEY: ""
+      PARLEY_ROOT_PRIVATE_KEY: ""
     expose:
       - "3000"
     networks:
@@ -44,18 +118,27 @@ services:
       - traefik
     labels:
       - "traefik.enable=true"
-      - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik}"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik-public}"
       - "traefik.http.routers.parley-miniapp.rule=Host(`${MINIAPP_HOST:-parley-miniapp.b11a.xyz}`)"
       - "traefik.http.routers.parley-miniapp.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
       - "traefik.http.routers.parley-miniapp.tls=true"
       - "traefik.http.routers.parley-miniapp.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
       - "traefik.http.services.parley-miniapp.loadbalancer.server.port=3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  hermes_state:
+    name: parley_hermes_state
 
 networks:
-  # The external network Traefik already lives on. Compose will fail with
-  # `network not found` if TRAEFIK_NETWORK doesn't match an existing network
-  # on the host — that's the right behaviour (catches typos at startup
-  # rather than silently 404ing on the public hostname).
+  default:
+    driver: bridge
   traefik:
     external: true
-    name: ${TRAEFIK_NETWORK:-traefik}
+    name: ${TRAEFIK_NETWORK:-traefik-public}

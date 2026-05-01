@@ -28,10 +28,10 @@ help:
 	@echo ""
 	@echo "Production (single VPS behind Traefik — Phase 6b):"
 	@echo "  make deploy-prod    axl-keys + build-prod + up-prod"
-	@echo "  make build-prod     docker compose -f compose.yml -f compose.prod.yml build"
-	@echo "  make up-prod        docker compose -f compose.yml -f compose.prod.yml up -d"
-	@echo "  make down-prod      docker compose -f compose.yml -f compose.prod.yml down"
-	@echo "  make logs-prod      docker compose -f compose.yml -f compose.prod.yml logs -f"
+	@echo "  make build-prod     docker compose -f compose.prod.yml build"
+	@echo "  make up-prod        docker compose -f compose.prod.yml up -d"
+	@echo "  make down-prod      docker compose -f compose.prod.yml down"
+	@echo "  make logs-prod      docker compose -f compose.prod.yml logs -f"
 	@echo ""
 	@echo "Prereqs: a populated .env at the repo root (see .env.example)."
 	@echo "Production additionally needs MINIAPP_HOST + TRAEFIK_* env vars set."
@@ -96,10 +96,10 @@ down:
 logs:
 	docker compose logs -f
 
-# Production overlay: layers compose.prod.yml on top of compose.yml.
-# Removes the miniapp's host port binding and wires Traefik labels for
-# HTTPS routing through your existing Traefik instance.
-PROD_COMPOSE := -f compose.yml -f compose.prod.yml
+# Production stack: standalone compose.prod.yml (NOT layered on compose.yml).
+# Same services as the dev stack but with no host port bindings and Traefik
+# labels on miniapp for HTTPS routing through your existing Traefik instance.
+PROD_COMPOSE := -f compose.prod.yml
 
 deploy-prod: check-env axl-keys build-prod up-prod
 	@echo ""
