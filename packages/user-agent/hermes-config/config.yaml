@@ -12,6 +12,25 @@ model:
   default: claude-haiku-4-5-20251001
   provider: anthropic
 
+# Defense-in-depth: redact strings that look like secrets (private keys,
+# API tokens) from any logged output. The agent itself doesn't emit
+# secrets in normal flow, but this is a backstop if a tool error message
+# ever surfaces an env value verbatim.
+security:
+  redact_secrets: true
+
+# Shorter clarification window than the 120s default — Parley flows
+# are interactive; if a user stalls for 60s mid-clarification, free
+# the slot rather than holding a partial conversation open.
+clarify:
+  timeout: 60
+
+# Group-mode hardening: if the bot ever ends up in a group chat
+# (typically by accident — Parley's surface is DM-only), each
+# participant gets an isolated conversation. Without this, a group
+# would share state across members.
+group_sessions_per_user: true
+
 providers:
   anthropic:
     api_key_env: ANTHROPIC_API_KEY
@@ -69,6 +88,16 @@ mcp_servers:
 
 agent:
   inherit_mcp_toolsets: true
+  # Abuse-prevention caps. A full Parley trade exchange uses ~10-15 LLM
+  # turns end-to-end (intent build → broadcast → poll → rank → sign
+  # round-trips → settle). 30 leaves comfortable headroom while bounding
+  # any single conversation's token spend if a user spams or the agent
+  # gets stuck in a tool loop.
+  max_turns: 30
+  # Shorter user-clarification window — a stalled session releases its
+  # slot sooner. Default is 120s; 60s is plenty for trading flows where
+  # the user is actively engaged.
+  api_max_retries: 2
   # SECURITY-CRITICAL: disable Hermes' built-in `memory` toolset.
   #
   # Hermes' memory tool writes to a SINGLE global ~/.hermes/memories/MEMORY.md
