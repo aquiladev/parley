@@ -17,6 +17,7 @@ import type {
   DealTerms,
   Intent,
   Offer,
+  OfferDecline,
   ParleyMessage,
   TokenRef,
   TradeRecord,
@@ -361,6 +362,7 @@ async function handleIntent(
       cache_age_ms: cacheAge,
       max_stale_ms: priceMaxStaleMs,
     });
+    await sendDecline(axl, intent, cfg, "price_unavailable");
     return;
   }
 
@@ -382,6 +384,12 @@ async function handleIntent(
       on_chain_balance_usdc_wei: inventory.usdc.toString(),
       on_chain_balance_weth_wei: inventory.weth.toString(),
     });
+    await sendDecline(
+      axl,
+      intent,
+      cfg,
+      "unsupported_pair_or_insufficient_balance",
+    );
     return;
   }
 
@@ -416,6 +424,38 @@ async function handleIntent(
     price: offer.price,
     expiry: offer.expiry,
   });
+}
+
+/** Phase 8b: send an `offer.decline` so the User Agent can short-circuit
+ *  its offer-collection wait instead of timing out. Failure to send is
+ *  logged but non-fatal — the User Agent's existing timeout path is the
+ *  fallback. Reply destination is the user's full AXL pubkey from the
+ *  intent body, matching the offer-send pattern above. */
+async function sendDecline(
+  axl: AxlClient,
+  intent: Intent,
+  cfg: NegotiatorConfig,
+  reason: string,
+): Promise<void> {
+  const decline: OfferDecline = {
+    type: "offer.decline",
+    intent_id: intent.id,
+    mm_agent_id: cfg.mmAddress,
+    mm_ens_name: cfg.mmEnsName,
+    reason,
+    timestamp: new Date().toISOString(),
+  };
+  try {
+    await axl.send(intent.from_axl_pubkey, JSON.stringify(decline));
+    log({ event: "decline_sent", intent_id: intent.id, reason });
+  } catch (err) {
+    log({
+      event: "decline_send_failed",
+      intent_id: intent.id,
+      reason,
+      err: (err as Error).message,
+    });
+  }
 }
 
 function handleAccept(

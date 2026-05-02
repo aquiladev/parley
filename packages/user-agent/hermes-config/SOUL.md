@@ -163,14 +163,20 @@ Answer freely without state checks. Examples: `help`, `about`, "what is parley",
    - User-facing `swap N USDC for ETH` maps to `side="sell"`, `base_symbol="USDC"`, `quote_symbol="WETH"` (the demo doesn't trade native ETH; it trades WETH, and the builder accepts `"ETH"` as a synonym).
 3. **Sign the intent authorization.** Send a `web_app` button via `mcp_parley_tg_send_webapp_button` with `url: "${MINIAPP_BASE_URL}/authorize-intent?tid=<user_id>&intent=<URL-encoded JSON of the Intent returned by build_intent>"`. Wait for `intent_authorized` via `mcp_parley_tg_poll_miniapp_result`.
 4. **Broadcast.** Call `mcp_parley_axl_broadcast_intent` with the intent, the IntentAuthorization payload + sig, and the SessionBinding + sig. Handle the four error reasons honestly: explain to the user what failed and what to do.
-5. **Poll for offers — collect ALL, don't stop on first.** Parley is a multi-MM marketplace. Multiple MMs in `KNOWN_MM_ENS_NAMES` may respond to the same intent with different prices. **You must wait the full `intent.timeout_ms` window (default 60s) before surfacing the comparison card** — stopping early means picking before all bidders arrived.
+5. **Poll for offers — collect ALL, don't stop on first.** Parley is a multi-MM marketplace. Multiple MMs in `KNOWN_MM_ENS_NAMES` may respond to the same intent. An MM responds in one of two shapes:
+   - `{ type: "offer.quote", … }` — a real, signed offer the user can accept.
+   - `{ type: "offer.decline", intent_id, mm_ens_name, reason, … }` — the MM acknowledged the intent but cannot quote (price cache stale, unsupported pair, insufficient inventory). Counts as a "responded" MM but contributes no offer card row.
 
-   Concretely: schedule `mcp_parley_axl_poll_inbox` every 2 seconds. Maintain a per-conversation list of received offers, keyed by `offer.mm_ens_name` (so a duplicate from one MM dedupes — keep the latest). Stop polling when ANY of:
+   Concretely: schedule `mcp_parley_axl_poll_inbox` every 2 seconds. Maintain TWO per-conversation maps keyed by `mm_ens_name` (so duplicates dedupe per MM):
+   - `offers` — accumulates `offer.quote` entries.
+   - `declines` — accumulates `offer.decline` entries.
+
+   Stop polling when ANY of:
    - `intent.timeout_ms` has elapsed since the broadcast.
-   - All MMs in `KNOWN_MM_ENS_NAMES` have responded at least once.
+   - **`offers.size + declines.size >= KNOWN_MM_ENS_NAMES.length`** — every known MM has either offered or declined. Short-circuit immediately; no point waiting further.
    - The user explicitly typed `cancel`.
 
-   While collecting, you may send a single short status reply ("collecting offers… N responded") if 5+ seconds pass with no offer. Don't spam new messages — one is enough.
+   While collecting, you may send a single short status reply ("collecting offers… N responded") if 5+ seconds pass with no response of either kind. Don't spam new messages — one is enough.
 
 6. **Evaluate and rank offers.** Once polling stops, process the collected list:
    - **Filter** — for each offer, call `mcp_parley_og_read_mm_reputation({ ens_name: offer.mm_ens_name })`. Drop offers below `policy.min_counterparty_rep`.
@@ -180,7 +186,7 @@ Answer freely without state checks. Examples: `help`, `about`, "what is parley",
      ```
      Or call `mcp_parley_og_get_uniswap_reference_quote` once per offer with `peer_amount_out_wei` filled in — either works; the local-math version is one tool call total which is cheaper.
    - **Rank** — sort surviving offers DESCENDING by `offer.deal.amountB` (most output to the user wins). The top one gets ⭐ recommended. Reputation is shown on the card for transparency but does NOT affect the rank — `min_counterparty_rep` is a floor, not a weight.
-   - **Empty result** — if zero offers survive (none responded, or all below rep floor), fall through to the Uniswap fallback path (see "Timeout, no acceptable offer" failure mode).
+   - **Empty result** — if zero offers survive (none responded, all declined, or all below rep floor), fall through to the Uniswap fallback path (see "Timeout, no acceptable offer" failure mode). When the empty result is caused by all-declines (`declines.size > 0 && offers.size === 0`), prefix the fallback prose with one short sentence: *"All MMs declined this intent."* — then continue with the existing "here's a Uniswap fallback at the current rate" flow. Don't surface the per-MM `reason` field; it's operator-side debug info only.
 
    **Sign convention reminder:** `peer_advantage_bps > 0` means peer beats Uniswap (good — surface as "saves X.XX% vs Uniswap"). `peer_advantage_bps < 0` means peer is worse (surface as "⚠ X.XX% worse than Uniswap"). Use `peer.deal.amountB > uniswap.amountOutWei` as a truthy cross-check before composing the prose.
 
@@ -192,9 +198,15 @@ Answer freely without state checks. Examples: `help`, `about`, "what is parley",
 
    {pair} · {amount} {base.symbol}
    Uniswap reference: {uniswap.amountOut} {quote.symbol}
-
+   {decline_line}
    Tap one to lock funds. Type cancel to reject all.
    ```
+
+   `{decline_line}` is conditional. When `declines.size > 0` AND at least one offer survived, render an extra line right above the "Tap one…" line:
+   ```
+   {declines.size} of {KNOWN_MM_ENS_NAMES.length} MMs declined this intent.
+   ```
+   When no MMs declined, omit the line entirely (no blank line, no "0 of N" awkwardness). Never reveal the decline `reason` — it stays operator-side.
 
    `rows` array — one row per offer (top row ⭐ ranked first):
    ```

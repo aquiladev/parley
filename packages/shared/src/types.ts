@@ -72,6 +72,32 @@ export interface Reject {
   reason?: string;
 }
 
+/**
+ * Phase 8b: MM-side decline-to-quote signal. Sent over AXL when an MM
+ * receives an Intent it cannot quote on (stale Uniswap reference cache,
+ * unsupported pair, insufficient inventory). Lets the User Agent
+ * short-circuit its offer-collection wait instead of timing out the
+ * full `intent.timeout_ms` window.
+ *
+ * Intentionally unsigned — declines are advisory; a forged decline can
+ * only shorten the User Agent's wait by one MM, never move funds. If
+ * forgery becomes a real abuse vector we'd add an EIP-712 envelope
+ * later, but for the demo the worst case is benign.
+ *
+ * `reason` is free-form; the User Agent doesn't surface it to end users
+ * (operator-side debugging only via `make logs-prod`). Current MM-side
+ * values: "price_unavailable" (Phase 8 cache stale / empty),
+ * "unsupported_pair_or_insufficient_balance" (Phase 1 inventory check).
+ */
+export interface OfferDecline {
+  type: "offer.decline";
+  intent_id: string;
+  mm_agent_id: Hex;
+  mm_ens_name: string;
+  reason: string;
+  timestamp: string;
+}
+
 export interface DealUserLocked {
   type: "deal.user_locked";
   deal_hash: Hex;
@@ -87,6 +113,7 @@ export interface DealMmLocked {
 export type ParleyMessage =
   | Intent
   | Offer
+  | OfferDecline
   | Accept
   | Reject
   | DealUserLocked
