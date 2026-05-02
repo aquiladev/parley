@@ -178,51 +178,65 @@ Answer freely without state checks. Examples: `help`, `about`, "what is parley",
 
    While collecting, you may send a single short status reply ("collecting offers… N responded") if 5+ seconds pass with no response of either kind. Don't spam new messages — one is enough.
 
-6. **Evaluate and rank offers.** Once polling stops, process the collected list:
-   - **Filter** — for each offer, call `mcp_parley_og_read_mm_reputation({ ens_name: offer.mm_ens_name })`. Drop offers below `policy.min_counterparty_rep`.
-   - **Reference price** — call `mcp_parley_og_get_uniswap_reference_quote({ intent, swapper: session_binding.wallet })` ONCE for the intent (no per-offer call needed; the Uniswap output is the same for every comparison). Then for each surviving offer, compute `peer_advantage_bps` locally:
-     ```
-     peer_advantage_bps = (peer.deal.amountB - uniswap.amountOutWei) * 10000 / uniswap.amountOutWei
-     ```
-     Or call `mcp_parley_og_get_uniswap_reference_quote` once per offer with `peer_amount_out_wei` filled in — either works; the local-math version is one tool call total which is cheaper.
-   - **Rank** — sort surviving offers DESCENDING by `offer.deal.amountB` (most output to the user wins). The top one gets ⭐ recommended. Reputation is shown on the card for transparency but does NOT affect the rank — `min_counterparty_rep` is a floor, not a weight.
-   - **Empty result** — if zero offers survive (none responded, all declined, or all below rep floor), fall through to the Uniswap fallback path (see "Timeout, no acceptable offer" failure mode). When the empty result is caused by all-declines (`declines.size > 0 && offers.size === 0`), prefix the fallback prose with one short sentence: *"All MMs declined this intent."* — then continue with the existing "here's a Uniswap fallback at the current rate" flow. Don't surface the per-MM `reason` field; it's operator-side debug info only.
+6. **Filter offers + compute the routing plan.** Once polling stops, do two things in order:
+   - **Filter on reputation** — for each offer, call `mcp_parley_og_read_mm_reputation({ ens_name: offer.mm_ens_name })`. Drop offers below `policy.min_counterparty_rep`.
+   - **Compute the plan** — call `mcp_parley_og_compute_routing_plan({ intent, offers: <surviving offers>, swapper: session_binding.wallet, min_peer_leg_pct: 25 })`.
+     The tool returns `{ ok: true, plans: [...] }` with up to 3 candidates: the recommended plan first, then 0–2 alternatives. Each plan has `{ label, kind, legs[], total_amount_out_wei, savings_bps_vs_uniswap, summary }`. Plan kinds:
+     - `pure_peer` — one peer offer covers the full intent
+     - `pure_uniswap` — single Uniswap fallback for the full intent
+     - `multi_leg` — 1+ peer legs + an optional Uniswap-tail leg for any unfilled remainder
 
-   **Sign convention reminder:** `peer_advantage_bps > 0` means peer beats Uniswap (good — surface as "saves X.XX% vs Uniswap"). `peer_advantage_bps < 0` means peer is worse (surface as "⚠ X.XX% worse than Uniswap"). Use `peer.deal.amountB > uniswap.amountOutWei` as a truthy cross-check before composing the prose.
+     The tool drops peer offers whose `deal.deadline - now < 90s` (can't execute strict-serial reliably) and peer legs smaller than `min_peer_leg_pct` of the intent (gas overhead eats savings on tiny legs).
+   - **Empty result** — `compute_routing_plan` returns `{ ok: false, error }` only when there are zero peer offers AND the Uniswap fallback is unavailable. In that rare case, tell the user that no path is currently quotable; suggest retrying in a moment.
+   - **All-decline note** — if `offers.size === 0 && declines.size > 0`, the recommended plan from the tool is `pure_uniswap` for the full intent. Prefix the surface prose with *"All MMs declined this intent."* so the user knows why.
 
-7. **Surface — multi-offer card via `mcp_parley_tg_send_webapp_buttons`.** ONE Telegram message with a text body summarizing the comparison and a multi-row inline keyboard, one row per surviving offer (cap at 3 to fit the screen comfortably).
+7. **Surface — plan-alternatives card via `mcp_parley_tg_send_webapp_buttons`.** ONE Telegram message. Body text template:
 
-   Body text template:
    ```
-   💱 Received {N} offers in {T:.1f}s
+   💱 {N} offers in {T:.1f}s{decline_suffix}
 
    {pair} · {amount} {base.symbol}
-   Uniswap reference: {uniswap.amountOut} {quote.symbol}
-   {decline_line}
-   Tap one to lock funds. Type cancel to reject all.
+   {recommended_plan.summary}
+
+   Tap a plan to start. Type cancel to abort.
    ```
 
-   `{decline_line}` is conditional. When `declines.size > 0` AND at least one offer survived, render an extra line right above the "Tap one…" line:
-   ```
-   {declines.size} of {KNOWN_MM_ENS_NAMES.length} MMs declined this intent.
-   ```
-   When no MMs declined, omit the line entirely (no blank line, no "0 of N" awkwardness). Never reveal the decline `reason` — it stays operator-side.
+   `{decline_suffix}` is `, {declines.size} declined` when `declines.size > 0`, else empty.
 
-   `rows` array — one row per offer (top row ⭐ ranked first):
-   ```
-   [
-     [{ label: "⭐ Accept {ens} · {amountOut} {sym} · saves {bps/100}% · rep {rep:.2f}",
-        url: "${MINIAPP_BASE_URL}/sign?tid={chat_id}&deal={URLENC(deal)}&offer_id={offer.id}&wallet={session.wallet}" }],
-     [{ label: "Accept {ens} · {amountOut} {sym} · saves {bps/100}% · rep {rep:.2f}",
-        url: "..." }],
-     ...
-   ]
-   ```
-   For worse-than-Uniswap offers replace `saves X%` with `⚠ X% worse`. Truncate ENS names to fit Telegram's button-label limits (~64 chars per label). One row per offer; stack vertically.
+   `rows` array — one row per plan returned by `compute_routing_plan` (already capped at 3):
 
-   No need for an explicit `[Reject]` button — typing `cancel` works (instructed in the body), and unselected offers expire on their own at `deal.deadline`.
+   ```
+   rows[0] = [{ label: "⭐ {plans[0].summary}",        url: <leg-1 url for plan 0> }]
+   rows[1] = [{ label: "Alt: {plans[1].summary}",      url: <leg-1 url for plan 1> }]   // if present
+   rows[2] = [{ label: "Alt: {plans[2].summary}",      url: <leg-1 url for plan 2> }]   // if present
+   ```
 
-8. **On user accept (one of the offers).** Whichever Mini App URL the user opens carries that offer's `offer_id`. The `/sign` flow proceeds against that one deal. Per the existing "On user accept" section below, `mcp_parley_axl_send_accept` is called for THAT MM's `mm_axl_pubkey` only. The other MM(s) never receive an Accept — their offers expire on the MM side cleanly (the Phase-6 `awaiting_accept` chain-probe doesn't apply since the user never locked for those deal_hashes).
+   The button URL points at the **first leg of that plan** — for a peer leg, the standard `/sign?tid=…&deal=…&offer_id=…&wallet=…` URL; for a Uniswap leg, the standard `/swap?to=…&data=…&value=…&pair=…&expected_input=…&expected_output=…&wallet=…` URL (with `&approval_token=…&approval_spender=…` when present). Truncate `summary` to ~64 chars to fit Telegram's button-label limit.
+
+   When the user taps a plan button, you ALSO record (in conversation history) the plan struct returned by the tool — you'll need it to surface the next leg's button after this one settles.
+
+8. **Strict-serial leg execution.** The user has tapped a plan; you have its `legs[]` array. Execute legs one at a time:
+
+   For each `leg` in order (state machine: `EXECUTING_PLAN { plan, current_leg_index }`):
+
+   a. **Pre-leg deadline re-check (peer legs only).** Before surfacing leg `i`, check `now >= leg.offer.deal.deadline - 30s`. If so, the offer is too close to expiry to execute reliably. **Replace this leg AND all remaining peer legs** with a single fresh Uniswap-tail: call `mcp_parley_og_prepare_fallback_swap` with the cumulative unfilled amount. Tell the user concisely (e.g., *"MM-2's offer expired — finishing the remaining 25 USDC on Uniswap."*) and continue with the new Uniswap leg.
+
+   b. **Surface the leg button.**
+      - If `leg.source === "peer"`: send a `web_app` button to `${MINIAPP_BASE_URL}/sign?tid={chat_id}&deal={URLENC(leg.offer.deal)}&offer_id={leg.offer.id}&wallet={session.wallet}`. Body: *"Leg {i+1}/{N}: lock {amount_in} {token} with {leg.offer.mm_ens_name}."*
+      - If `leg.source === "uniswap"`: send a `web_app` button to `${MINIAPP_BASE_URL}/swap?to={leg.prepared.to}&data={leg.prepared.data}&value={leg.prepared.value}&pair={base}/{quote}&expected_input={leg.prepared.expectedInput}&expected_output={leg.prepared.expectedOutput}&wallet={session.wallet}` (plus `&approval_token=…&approval_spender=…` if `leg.prepared.approvalRequired`). Body: *"Leg {i+1}/{N}: swap {amount_in} via Uniswap."*
+
+   c. **Wait for terminal state.**
+      - For peer legs: poll `mcp_parley_tg_poll_miniapp_result` for `lock_submitted`, then poll `mcp_parley_og_read_settlement_state` until `state === "Settled"`. Write the per-leg `TradeRecord` (existing flow). Call `mcp_parley_axl_send_accept` for THAT MM's `mm_axl_pubkey` only — other peer offers in the original plan that were dropped or replaced never receive an Accept.
+      - For Uniswap legs: poll `mcp_parley_tg_poll_miniapp_result` for `swapped`. No `TradeRecord` (Uniswap legs aren't peer trades; reputation doesn't apply).
+
+   d. **Advance to leg i+1.** Only after this leg has confirmed terminal state. If the user types `cancel` between legs, stop. Already-completed legs stand (each was its own atomic Deal). Acknowledge: *"Stopped after leg {i+1}/{N}. You received {sum of completed amount_out}; {remaining_amount_in} unfilled."*
+
+   e. **All legs complete.** Summarize: *"Plan complete. Total received: {sum}. Saved {bps_vs_uniswap}% vs all-Uniswap."*
+
+   **Failure handling per leg:**
+   - **Leg reverts on-chain** (any reason): stop the plan. Suggest retrying that single leg or `cancel` to abandon. Already-settled prior legs stand.
+   - **User rejects in wallet:** same as revert — stop, don't auto-retry.
+   - **Peer leg's MM never locks (`UserLocked` past deadline+30s):** existing refund flow per `Settlement.refund(deal_hash)`. User gets that leg's input back; subsequent legs are unstarted; offer the option to continue the remaining legs as a fresh Uniswap-tail.
 
 ### On user accept
 

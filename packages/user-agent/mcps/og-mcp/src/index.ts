@@ -35,7 +35,7 @@ import { z } from "zod";
 import { createPublicClient, http, parseAbi, type Hex } from "viem";
 import { sepolia } from "viem/chains";
 import { normalize } from "viem/ens";
-import type { TradeRecord } from "@parley/shared";
+import type { Offer, TradeRecord } from "@parley/shared";
 
 import {
   appendMMRecord,
@@ -54,6 +54,8 @@ import {
   computeSavingsBps,
   getUniswapQuote,
   prepareFallbackSwap,
+  type PreparedFallbackSwap,
+  type UniswapIntent,
 } from "./uniswap.js";
 
 const SEPOLIA_RPC_URL = process.env["SEPOLIA_RPC_URL"];
@@ -694,6 +696,338 @@ server.registerTool(
   },
 );
 
+// Phase 9 — multi-leg routing plan computation.
+//
+// Given an Intent, the surviving peer Offers (post-rep-filter), and the
+// user's wallet for Uniswap calldata, this tool returns a ranked list of
+// candidate plans:
+//   - "pure_peer": one peer offer covers the full intent
+//   - "pure_uniswap": single Uniswap fallback for the full intent
+//   - "multi_leg": 1+ peer legs + optional Uniswap tail for the remainder
+//
+// Algorithm:
+//   1. Filter offers whose `deal.deadline - now < 90s` — too tight to
+//      execute strict-serial reliably.
+//   2. Sort surviving offers by effective rate (amountB / amountA) DESC.
+//   3. Greedy peer loop: take min(offer.amountA, remaining); skip if take
+//      < intent.amount × min_peer_leg_pct / 100.
+//   4. If remaining > 0, ask Uniswap for a tail leg via prepareFallbackSwap.
+//   5. Compute "pure_uniswap" for the full intent as an alternative.
+//   6. Pick highest-output plan as recommended.
+//
+// All numeric values returned as decimal strings (bigints don't survive
+// JSON serialization).
+
+interface PeerLeg {
+  source: "peer";
+  offer: Offer;
+  amount_in_wei: string;
+  amount_out_wei: string;
+}
+
+interface UniswapLeg {
+  source: "uniswap";
+  prepared: PreparedFallbackSwap;
+  amount_in_wei: string;
+  amount_out_wei: string;
+}
+
+type Leg = PeerLeg | UniswapLeg;
+
+interface Plan {
+  label: "recommended" | "alternative";
+  kind: "pure_peer" | "pure_uniswap" | "multi_leg";
+  legs: Leg[];
+  total_amount_out_wei: string;
+  savings_bps_vs_uniswap: number;
+  summary: string;
+}
+
+const RoutingPlanIntentSchema = FallbackIntentSchema; // same shape — side, base, quote, amount, slippage
+
+const RoutingPlanOfferSchema = z
+  .object({
+    type: z.literal("offer.quote"),
+    id: z.string(),
+    intent_id: z.string(),
+    mm_agent_id: z.string(),
+    mm_ens_name: z.string(),
+    price: z.string(),
+    amount: z.string(),
+    expiry: z.number(),
+    settlement_window_ms: z.number(),
+    deal: z.object({
+      user: z.string(),
+      mm: z.string(),
+      tokenA: z.string(),
+      tokenB: z.string(),
+      amountA: z.string(),
+      amountB: z.string(),
+      deadline: z.number(),
+      nonce: z.string(),
+    }),
+    signature: z.string(),
+  })
+  .passthrough();
+
+server.registerTool(
+  "compute_routing_plan",
+  {
+    description:
+      "Phase 9 multi-leg routing planner. Given an intent + surviving peer offers + user wallet, returns ranked candidate plans (pure_peer / pure_uniswap / multi_leg). Recommended plan is the highest-output combination. Multi-leg combines greedy best-rate peer fills with a Uniswap-tail for any unfilled remainder. Drops peer offers whose `deal.deadline - now < 90s` (can't execute strict-serial reliably). Drops peer legs smaller than `min_peer_leg_pct` percent of the intent (gas overhead eats savings on tiny legs; default 25). All wei values are decimal strings. Returns `{ ok:true, plans:[...] }` or `{ ok:false, error }`.",
+    inputSchema: {
+      intent: RoutingPlanIntentSchema,
+      offers: z.array(RoutingPlanOfferSchema),
+      swapper: z.string(),
+      min_peer_leg_pct: z.number().int().min(0).max(100).default(25),
+    },
+  },
+  async ({ intent, offers, swapper, min_peer_leg_pct }) => {
+    try {
+      const result = await computeRoutingPlan(
+        intent as UniswapIntent,
+        offers as unknown as Offer[],
+        swapper as Hex,
+        min_peer_leg_pct,
+      );
+      return {
+        content: [
+          { type: "text", text: JSON.stringify(result, null, 2) },
+        ],
+        isError: !result.ok,
+      };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { ok: false, error: (err as Error).message },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
+async function computeRoutingPlan(
+  intent: UniswapIntent,
+  offers: Offer[],
+  swapper: Hex,
+  minPeerLegPct: number,
+): Promise<{ ok: true; plans: Plan[] } | { ok: false; error: string }> {
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  // Resolve which token is the user's input (denominator for amount math).
+  const userInToken = intent.side === "sell" ? intent.base : intent.quote;
+  const userOutToken = intent.side === "sell" ? intent.quote : intent.base;
+
+  const intentAmountWei = parseUnitsBigInt(intent.amount, userInToken.decimals);
+  if (intentAmountWei === 0n) {
+    return { ok: false, error: "intent.amount parses to zero" };
+  }
+  const minLegWei = (intentAmountWei * BigInt(minPeerLegPct)) / 100n;
+
+  // Filter + sort offers
+  const valid = offers.filter((o) => o.deal.deadline - nowSec >= 90);
+  const sorted = [...valid].sort((a, b) => {
+    // Compare effective rates (amountB / amountA) without floating point.
+    // a's rate > b's rate ⇔ a.amountB * b.amountA > b.amountB * a.amountA
+    const lhs = BigInt(a.deal.amountB) * BigInt(b.deal.amountA);
+    const rhs = BigInt(b.deal.amountB) * BigInt(a.deal.amountA);
+    return lhs > rhs ? -1 : lhs < rhs ? 1 : 0;
+  });
+
+  // Greedy peer fill
+  const peerLegs: PeerLeg[] = [];
+  let remaining = intentAmountWei;
+  for (const offer of sorted) {
+    if (remaining === 0n) break;
+    const offerAmountA = BigInt(offer.deal.amountA);
+    const take = offerAmountA < remaining ? offerAmountA : remaining;
+    if (take < minLegWei) continue;
+    // Output proportional to input within this offer (peer rate is fixed).
+    const offerAmountB = BigInt(offer.deal.amountB);
+    const out = (offerAmountB * take) / offerAmountA;
+    peerLegs.push({
+      source: "peer",
+      offer,
+      amount_in_wei: take.toString(),
+      amount_out_wei: out.toString(),
+    });
+    remaining -= take;
+  }
+
+  // Uniswap tail (if remaining > 0)
+  let tail: UniswapLeg | null = null;
+  if (remaining > 0n) {
+    const tailHuman = formatUnitsBigInt(remaining, userInToken.decimals);
+    const tailFb = await prepareFallbackSwap(
+      { ...intent, amount: tailHuman },
+      swapper,
+    );
+    if (tailFb.ok) {
+      tail = {
+        source: "uniswap",
+        prepared: tailFb.value,
+        amount_in_wei: parseUnitsBigInt(tailFb.value.expectedInput, userInToken.decimals).toString(),
+        amount_out_wei: parseUnitsBigInt(tailFb.value.expectedOutput, userOutToken.decimals).toString(),
+      };
+    }
+  }
+
+  // Pure-Uniswap baseline (used both as alternative and as comparison
+  // basis for savings_bps_vs_uniswap).
+  const pureFb = await prepareFallbackSwap(intent, swapper);
+  const pureUniswap: UniswapLeg | null = pureFb.ok
+    ? {
+        source: "uniswap",
+        prepared: pureFb.value,
+        amount_in_wei: parseUnitsBigInt(pureFb.value.expectedInput, userInToken.decimals).toString(),
+        amount_out_wei: parseUnitsBigInt(pureFb.value.expectedOutput, userOutToken.decimals).toString(),
+      }
+    : null;
+
+  const uniswapBaseline = pureUniswap
+    ? BigInt(pureUniswap.amount_out_wei)
+    : 0n;
+
+  // Build candidate plans
+  const candidates: Plan[] = [];
+
+  // Recommended candidate from greedy fill
+  const recLegs: Leg[] = [...peerLegs];
+  if (tail) recLegs.push(tail);
+  if (recLegs.length > 0) {
+    const recKind: Plan["kind"] =
+      peerLegs.length > 0 && tail
+        ? "multi_leg"
+        : peerLegs.length > 0
+          ? "pure_peer"
+          : "pure_uniswap";
+    candidates.push(buildPlan(recLegs, recKind, uniswapBaseline, "recommended"));
+  }
+
+  // Pure-Uniswap alternative (always include if computable, dedupe later)
+  if (pureUniswap) {
+    candidates.push(
+      buildPlan([pureUniswap], "pure_uniswap", uniswapBaseline, "alternative"),
+    );
+  }
+
+  // Best-peer-only alternative when top peer covers the full intent
+  const top = sorted[0];
+  if (top && BigInt(top.deal.amountA) >= intentAmountWei) {
+    const onlyLeg: PeerLeg = {
+      source: "peer",
+      offer: top,
+      amount_in_wei: intentAmountWei.toString(),
+      amount_out_wei: (
+        (BigInt(top.deal.amountB) * intentAmountWei) /
+        BigInt(top.deal.amountA)
+      ).toString(),
+    };
+    candidates.push(
+      buildPlan([onlyLeg], "pure_peer", uniswapBaseline, "alternative"),
+    );
+  }
+
+  if (candidates.length === 0) {
+    return {
+      ok: false,
+      error: "no plan possible (no peer offers and Uniswap fallback unavailable)",
+    };
+  }
+
+  // Pick recommended = highest output. Re-label the rest as alternatives,
+  // dedupe by leg-signature so we don't show "best peer only" alongside
+  // an identical pure_peer recommendation.
+  candidates.sort(
+    (a, b) =>
+      BigInt(b.total_amount_out_wei) > BigInt(a.total_amount_out_wei) ? 1 :
+      BigInt(b.total_amount_out_wei) < BigInt(a.total_amount_out_wei) ? -1 : 0,
+  );
+  const seen = new Set<string>();
+  const uniquePlans: Plan[] = [];
+  for (const [i, plan] of candidates.entries()) {
+    const sig = legSignature(plan);
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    uniquePlans.push({ ...plan, label: i === 0 ? "recommended" : "alternative" });
+  }
+  // Cap at 3 (recommended + ≤2 alternatives) for the Telegram card row limit.
+  return { ok: true, plans: uniquePlans.slice(0, 3) };
+}
+
+function buildPlan(
+  legs: Leg[],
+  kind: Plan["kind"],
+  uniswapBaseline: bigint,
+  label: Plan["label"],
+): Plan {
+  const total = legs.reduce((acc, l) => acc + BigInt(l.amount_out_wei), 0n);
+  const savings =
+    uniswapBaseline > 0n
+      ? Number((total - uniswapBaseline) * 10000n / uniswapBaseline)
+      : 0;
+  return {
+    label,
+    kind,
+    legs,
+    total_amount_out_wei: total.toString(),
+    savings_bps_vs_uniswap: savings,
+    summary: planSummary(legs, kind, savings),
+  };
+}
+
+function planSummary(legs: Leg[], kind: Plan["kind"], savingsBps: number): string {
+  const parts: string[] = [];
+  for (const l of legs) {
+    if (l.source === "peer") {
+      parts.push(`${l.offer.mm_ens_name}: ${l.amount_in_wei} wei`);
+    } else {
+      parts.push(`Uniswap: ${l.amount_in_wei} wei`);
+    }
+  }
+  const savingsStr =
+    savingsBps === 0
+      ? ""
+      : ` (${savingsBps > 0 ? "+" : ""}${(savingsBps / 100).toFixed(2)}% vs Uniswap)`;
+  return `${kind} — ${parts.join(" + ")}${savingsStr}`;
+}
+
+function legSignature(plan: Plan): string {
+  return plan.legs
+    .map((l) =>
+      l.source === "peer"
+        ? `peer:${l.offer.id}:${l.amount_in_wei}`
+        : `uni:${l.amount_in_wei}`,
+    )
+    .join("|");
+}
+
+function parseUnitsBigInt(human: string, decimals: number): bigint {
+  const trimmed = human.trim();
+  if (trimmed === "" || trimmed === "0") return 0n;
+  const [whole, frac = ""] = trimmed.split(".");
+  const fracPadded = (frac + "0".repeat(decimals)).slice(0, decimals);
+  return BigInt((whole ?? "0") + fracPadded);
+}
+
+function formatUnitsBigInt(amountWei: bigint, decimals: number): string {
+  if (decimals === 0) return amountWei.toString();
+  const divisor = 10n ** BigInt(decimals);
+  const whole = amountWei / divisor;
+  const frac = amountWei % divisor;
+  if (frac === 0n) return whole.toString();
+  const fracStr = frac.toString().padStart(decimals, "0").replace(/0+$/, "");
+  return `${whole}.${fracStr}`;
+}
+
 async function fetchAllSafely(rootHashes: string[]): Promise<TradeRecord[]> {
   const results = await Promise.all(
     rootHashes.map(async (h) => {
@@ -716,5 +1050,6 @@ await server.connect(transport);
 process.stderr.write(
   "[og-mcp] connected (resolve_mm, read_mm_reputation, read_user_reputation, " +
     "write_trade_record, read_trade_history, prepare_fallback_swap, " +
-    "get_uniswap_reference_quote, read_settlement_state, read_wallet_balance)\n",
+    "get_uniswap_reference_quote, read_settlement_state, read_wallet_balance, " +
+    "compute_routing_plan)\n",
 );

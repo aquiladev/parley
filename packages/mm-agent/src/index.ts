@@ -25,7 +25,12 @@ import type {
 
 import { AxlClient } from "./axl-client.js";
 import { ensureAxlPubkeyOnEns } from "./axl-identity.js";
-import { fetchInventoryFromChain, loadReserveLimitsFromEnv } from "./inventory.js";
+import {
+  applyReservations,
+  fetchInventoryFromChain,
+  loadReserveLimitsFromEnv,
+  reservedOutflows,
+} from "./inventory.js";
 import {
   buildOffer,
   digest,
@@ -369,20 +374,39 @@ async function handleIntent(
   // Live chain read — the source of truth for what we actually have to trade.
   // Decouples quoting decisions from any env-driven cap so a cold restart
   // with the same hot wallet picks up exactly where the chain says we are.
-  const inventory = await fetchInventoryFromChain(
+  const chainInventory = await fetchInventoryFromChain(
     wallet.publicClient,
     cfg.mmAddress,
     cfg.knownTokens,
   );
 
-  const prepared = buildOffer(intent, inventory, cached.value, cfg);
+  // Phase 9 reservation: subtract outflows promised on still-live offers
+  // (signed but not yet settled/refunded). Without this, two concurrent
+  // intents from different users get quoted against the same chain
+  // balance and the MM accepts more than it can deliver. The MM's main
+  // loop is single-threaded so `pending.set` always completes before
+  // the next handleIntent reads it — no lock needed.
+  const reserved = reservedOutflows(
+    Array.from(pending.values(), (p) => ({
+      outflow: p.outflow,
+      state: p.state,
+      deadlineSec: p.deal.deadline,
+    })),
+  );
+  const available = applyReservations(chainInventory, reserved);
+
+  const prepared = buildOffer(intent, available, cached.value, cfg);
   if (!prepared) {
     log({
       event: "intent_skipped",
       intent_id: intent.id,
       reason: "unsupported_pair_or_insufficient_balance",
-      on_chain_balance_usdc_wei: inventory.usdc.toString(),
-      on_chain_balance_weth_wei: inventory.weth.toString(),
+      on_chain_balance_usdc_wei: chainInventory.usdc.toString(),
+      on_chain_balance_weth_wei: chainInventory.weth.toString(),
+      reserved_usdc_wei: reserved.usdc.toString(),
+      reserved_weth_wei: reserved.weth.toString(),
+      available_usdc_wei: available.usdc.toString(),
+      available_weth_wei: available.weth.toString(),
     });
     await sendDecline(
       axl,
@@ -423,6 +447,9 @@ async function handleIntent(
     deal_hash: dealHashHex,
     price: offer.price,
     expiry: offer.expiry,
+    partial: prepared.partial,
+    intent_amount: intent.amount,
+    offer_amount: offer.amount,
   });
 }
 

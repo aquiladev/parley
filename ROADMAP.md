@@ -312,6 +312,43 @@ This phase is grounded in `deployment.md`, the working document that tracks depl
 
 ---
 
+## Phase 9 — Smart routing with partial fills + multi-leg execution
+
+**Estimate:** 1–2 days
+**Tester readiness:** the agent visibly *thinks* — picks a fill plan and explains the trade-off
+
+**Goal:** the User Agent stops being a passive offer-displayer and becomes an active router. It computes the optimal fill plan combining 1+ partial peer legs with an optional Uniswap-tail leg, surfaces it as the recommended option (with 1–2 alternatives), and the user picks. Legs execute strict-serial — each leg's chain state confirms `Settled` before the next leg's button appears, preserving per-deal atomicity.
+
+**Outcomes:**
+
+- [x] **MM partial offers.** `negotiator.ts:buildOffer` no longer declines when its inventory can't cover the full intent — it sizes the offer down to whatever's available and emits a partial. The wire-format `Offer` doesn't change; the User Agent detects partial by comparing `offer.deal.amountA < intent.amount`. New helpers `maxOutflow`, `reservedOutflows`, `applyReservations` in `inventory.ts`. New `partial: bool` on `PreparedOffer` for MM-side logging.
+
+- [x] **Concurrent-intent reservation (latent-bug fix).** Before sizing each new offer, the MM subtracts in-flight outflows from prior live offers (`pending: Map<offer_id, PendingDeal>`) from the chain inventory. Two concurrent intents from different users no longer get quoted against the same balance. `reservedOutflows` skips entries past their deadline so the next intent isn't blocked by an effectively-dead reservation.
+
+- [x] **Routing planner tool.** New `mcp_parley_og_compute_routing_plan` in og-mcp. Takes intent + offers + swapper + min_peer_leg_pct (default 25); returns up to 3 ranked plans with full leg breakdowns (`pure_peer | pure_uniswap | multi_leg`), `total_amount_out_wei`, `savings_bps_vs_uniswap`, and a human `summary`. Algorithm: filter offers with deadline < 90s, sort by effective rate descending, greedy-fill until intent covered or peers exhausted, optional Uniswap tail for remainder. Caps tiny legs (< 25% of intent) to avoid gas-eats-savings cases. Reuses existing `prepareFallbackSwap` / `getUniswapQuote` from `uniswap.ts`.
+
+- [x] **SOUL.md plan-based flow** (Steps 6–8 rewritten). Step 6 calls `compute_routing_plan` instead of doing rate math in the LLM. Step 7 surfaces a single message with the recommended plan + 1–2 alternatives as stacked `web_app` buttons. Step 8 is a strict-serial state machine: each leg surfaces only after the previous one's chain state confirms `Settled`/`swapped`. Pre-button deadline re-check replaces stale peer legs with a Uniswap-tail.
+
+- [x] **No contract change.** Each leg is its own atomic `Deal` with its own `lockUserSide` + `lockMMSide` + `settle` cycle. Sequential UI is the intentional cost; an `Aggregator.sol` for single-signature batching is deferred to a future phase.
+
+- [x] **Operator-facing `MM_OFFER_EXPIRY_MS` guidance.** `.env.example` notes the default 5-minute window is fine for 2-leg plans on Sepolia; bump to 600000 (10 min) for 3+ legs or sluggish-RPC environments.
+
+**Verification:**
+
+- [ ] **MM offers partial when inventory short.** Fund MM with only 30 USDC; send a 50 USDC intent. MM emits `offer.quote` with `deal.amountA = 30`, not a decline. `make logs-prod` shows `partial: true` in `offer_sent`.
+- [ ] **Concurrent-intent regression test.** Two back-to-back intents from different user wallets requesting 25 USDC each, with MM holding 30 USDC: first gets 25, second gets 5 (or declines if 5 < 25% threshold of the second's intent). MM never over-commits.
+- [ ] **Hybrid plan recommended.** With MM-1 offering 30 of 50 USDC at 2% savings, recommended = `[MM-1: 30, Uniswap: 20]`; alternatives = `[All Uniswap]` and `[MM-1 only (30 partial)]`.
+- [ ] **Pure Uniswap recommended when all peers worse.** Both MMs offer at rates worse than Uniswap → recommended = `[Uniswap: 50]`. Peer offers don't appear as buttons.
+- [ ] **Multi-MM split.** MM-1 offers 25, MM-2 offers 25 → plan `[MM-1: 25, MM-2: 25]`. Leg 2's button surfaces ONLY after leg 1's chain state confirms `Settled`.
+- [ ] **Threshold drops tiny legs.** MM-1 offers 5 of 50 (10% < 25%) → MM-1 leg dropped. Recommended = pure Uniswap or MM-2-plus-Uniswap.
+- [ ] **Cancel mid-plan.** Tap multi-leg recommendation; after leg 1 settles, type `cancel`. Plan stops; remaining legs unexecuted; user keeps leg 1's output.
+- [ ] **Plan-stale deadline rescue.** With `MM_OFFER_EXPIRY_MS=120000`, run a slow leg-1; by the time leg-2 should surface, MM-2's deadline is < 30s. Agent detects, replaces leg-2 + remaining peer legs with a Uniswap-tail, surfaces a `/swap` button, plan completes.
+- [ ] **Full plan output verified on-chain.** Recommended `[MM-1: 30, Uniswap: 20]` produces two separate Settlement deals + one Uniswap swap on Sepolia Etherscan. Total received matches the plan's `total_amount_out_wei`.
+
+**Demoable state:** the User Agent stops just listing offers and starts thinking out loud — the chat shows *"recommended plan: 30 USDC via mm-1 + 20 USDC via Uniswap (saves 1.6% vs all-Uniswap)"* with one tap to start. Multi-MM splits visibly demonstrate Parley's value over a single-source aggregator.
+
+---
+
 ## Risk register
 
 Things that could derail the build, with mitigations. Listed in approximate order of "this is the one I'd be most worried about."
