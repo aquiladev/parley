@@ -42,40 +42,54 @@ A live testnet deployment is running. **Bot:** [`@x5ar1ey_bot`](https://t.me/x5a
 
 In the Mini App, pick **WalletConnect**, scan the QR with your wallet (or tap a wallet name on mobile to deep-link), approve the session. You'll be asked to sign a small message — that's the **session binding** (proves you control the wallet you just connected; valid 24h). The bot acknowledges with your address.
 
-**2. Issue an intent.** Type a swap in plain language:
+**2. Issue an intent.** Type a swap in plain language. Both canonical pairs (USDC ↔ WETH/ETH) and any other token the operator has configured work the same way:
 
 ```
 swap 5 USDC for ETH
 swap 0.001 ETH for USDC
+swap 0.05 WETH for UNI
+sell all UNI for WETH
 ```
+
+For tokens the agent doesn't recognize by symbol, paste the contract address inline — `swap 0.01 ETH for 0x1f9840a85d5af5bf1d1762f925bdaddc4201f984` works too. The agent looks up decimals on-chain and proceeds.
 
 The bot:
 - Builds an Intent (your swap parameters as a structured object) and shows you the parameters
 - Asks you to **authorize the intent** — another tap, another EIP-712 signature inside the Mini App. This binds your intent to your session so the privileged tools (broadcast, accept, write-trade-record per [SPEC §4.3](SPEC.md)) will accept it.
-- Broadcasts to all known MMs over the Gensyn AXL mesh and waits up to ~60s for offers.
+- Broadcasts to all known MMs over the Gensyn AXL mesh and waits up to ~60s for offers. MMs that don't support your pair respond with `offer.decline` (counts as "answered" so polling stops promptly).
 
-**3. Pick an offer.** You'll see one Telegram message titled *"💱 Received N offers in T s"* with a row per MM:
+**3. Pick a plan.** You'll see one Telegram message titled *"💱 Received N offers in T s"* with one or more candidate **routing plans**:
 
 ```
-⭐ Accept mm-1.parley.eth · 0.0033 ETH · saves 0.42% · rep 0.85
-   Accept mm-2.parley.eth · 0.0032 ETH · saves 0.10% · rep 0.71
+⭐ pure_peer (mm-1.parley.eth) · 0.0033 ETH · saves 0.42% · rep 0.85
+   pure_uniswap                · 0.0032 ETH · baseline
+   split_route (60% mm-2 + 40% Uniswap) · 0.00329 ETH · saves 0.21% · rep 0.71
 ```
 
-The top row (⭐) is the recommended pick — sorted by output amount, most-output-to-you wins. Reputation is shown on each row for transparency but does NOT affect ranking; `policy.min_counterparty_rep` is a floor that drops below-threshold MMs, not a weight. Offers worse than Uniswap render as `⚠ X.XX% worse than Uniswap` instead of `saves X.XX%`.
+Each row is a complete plan, not just a single offer. The smart router (Phase 9) considers four shapes and surfaces whichever yields the most output:
 
-Tap any row → the **Sign** Mini App opens. Three things happen:
+- **`pure_peer`** — one MM fills the whole intent.
+- **`pure_uniswap`** — direct Uniswap v3 fallback (always available as a baseline).
+- **`split_route`** — multi-MM partial fill (e.g., mm-1 takes 0.6 of the intent at its tighter spread, mm-2 takes the rest).
+- **`peer_plus_uniswap_tail`** — peer offers cover the front of the intent; Uniswap finishes the remainder when no MM has enough inventory for the full size.
+
+The top row (⭐) is the recommended pick — sorted by output amount, most-output-to-you wins. Reputation is shown on each row for transparency but does NOT affect ranking; `policy.min_counterparty_rep` is a floor that drops below-threshold MMs, not a weight. Plans worse than Uniswap render as `⚠ X.XX% worse than Uniswap` instead of `saves X.XX%`.
+
+Tap any row → the **Sign** Mini App opens for the first leg of the chosen plan. Three things happen:
 
 1. **Sign the Deal** (EIP-712) — the canonical settlement terms (tokens, amounts, deadline, nonce). This is what the contract checks at lock + settle time.
 2. **Sign the Accept Authorization** (EIP-712) — auth for your agent to send the Accept message to the MM on your behalf.
-3. **Submit `lockUserSide` tx** — your wallet pops up to confirm. This is the **only on-chain transaction you submit yourself** for this trade. It pulls `tokenA` (the input you're selling) into the Settlement contract.
+3. **Submit `lockUserSide` tx** — your wallet pops up to confirm. This is the **only on-chain transaction you submit yourself** for this leg. It pulls `tokenA` (the input you're selling) into the Settlement contract.
 
 If your wallet asks for an `approve` first because you've never spent that token from this address, do that before the lock — the Mini App handles the prompt.
+
+For multi-leg plans (`split_route` / `peer_plus_uniswap_tail`), the bot serializes the legs strictly: leg 2 only surfaces after leg 1 settles on chain. If you `cancel` between legs, already-settled legs stand — each is its own atomic Deal.
 
 **4. Settle.** Wait ~10–30s. The MM Agent watches the chain, sees `UserLocked`, submits its own `lockMMSide` tx, and the chain transitions to `BothLocked`. The bot polls Settlement state and once it sees `BothLocked` it sends a *Settle* button. Tap → submit `settle()` from the Mini App → atomic swap. You receive your output token; the MM receives the input.
 
 The bot reports the settlement tx hash. Click through to Sepolia Etherscan — you can verify that `Settled(bytes32 indexed dealHash)` was emitted by the contract at [`0xE5e7…E219`](https://sepolia.etherscan.io/address/0xE5e766d8fEdd8705d537D0016f1A2bff852fE219).
 
-**5. Verify.** Type `balance` to see your updated USDC + WETH + ETH. Type `history` to see the trade in your reputation history.
+**5. Verify.** Type `balance` to see updated balances across all configured tokens (ETH plus every ERC-20 the operator added — typically USDC, WETH, and any extras like UNI). Type `history` to see the trade in your reputation history. Reputation scores update once the MM Agent's TradeRecord blob lands on 0G Storage and the new ENS `reputation_root` setText confirms — usually within a minute or two on Sepolia, longer if the 0G testnet storage nodes are lagging chain sync.
 
 ### Other commands worth trying
 
@@ -84,7 +98,7 @@ Type these as plain words — **no leading slash**.
 | Command | What it does |
 |---|---|
 | `help` | Full command reference |
-| `balance` | Wallet balances on Sepolia (ETH, USDC, WETH) |
+| `balance` | Wallet balances on Sepolia — ETH plus every operator-configured ERC-20 (USDC, WETH, and any others like UNI) |
 | `history` | Your past trades + reputation score |
 | `policy` | Adjust min counterparty rep, max slippage, intent timeout |
 | `cancel` | Cancel an in-flight intent before signing |
@@ -94,7 +108,10 @@ Type these as plain words — **no leading slash**.
 ### Edge cases worth poking at
 
 - **Cancel an intent mid-flight.** Type `cancel` while the bot is *Collecting offers…*. State should clear cleanly; nothing on-chain happens.
-- **No peer offer beats Uniswap.** Try a very small or very large swap so the MMs' spread underperforms the Uniswap reference. The bot should offer a direct Uniswap v3 fallback swap (`QuoterV2` + `SwapRouter02` on Sepolia) instead.
+- **No peer offer beats Uniswap.** Try a very small or very large swap so the MMs' spread underperforms the Uniswap reference. The bot should recommend the `pure_uniswap` plan and route directly through Uniswap v3 (`QuoterV2` + `SwapRouter02` on Sepolia).
+- **Trigger a split route.** Type a swap larger than any single MM's per-pair inventory cap. The router (Phase 9) should produce a `split_route` plan — leg 1 fills against MM-A, leg 2 against MM-B (or a Uniswap tail). Each leg is signed and locked separately, in order.
+- **Multi-token via inline address.** Try pasting an arbitrary ERC-20 address inline: `swap 0.01 ETH for 0x1f9840a85d5af5bf1d1762f925bdaddc4201f984` (UNI). The agent looks up decimals on-chain via `validate_token`, builds the intent, and either gets a peer offer (if the MM operator supports the pair) or falls through to Uniswap.
+- **Unsupported pair, peers decline.** Try a pair no MM has configured (e.g., random ERC-20 ↔ random ERC-20). Both MMs reply with `offer.decline (unsupported_pair)`. The agent doesn't pre-filter — it broadcasts to everyone, then aggregates the declines and offers the Uniswap path.
 - **Refund.** Lock `tokenA` and then never tap *Settle*. After the deal deadline (~5 min), the bot should surface a *Refund* button. Tap it to recover your locked funds. (Hard to trigger reliably because the MM auto-locks fast; mainly useful for reading the contract's `refund` path.)
 - **Multiple intents in parallel.** Issue a second swap while the first is mid-settlement. Each deal lives in its own Settlement storage slot; concurrent deals can't interfere with each other.
 
@@ -118,7 +135,7 @@ Walking through the flow above exercises every load-bearing piece of the protoco
 - **EIP-712 binding**: the same `dealHash` was signed by both parties, validated by the contract, and used as the storage key.
 - **AXL mesh transport**: your intent reached two independently-running MM containers without any central broker.
 - **ENS-resolved identity**: each MM's offer was verified by resolving its ENS subname's `addr` + `axl_pubkey` text records and checking that the AXL sender + EIP-712 signer matched.
-- **0G-anchored reputation**: a `TradeRecord` blob was written to 0G Storage and indexed against both your wallet and the MM's ENS name; future `/history` calls fetch and verify it via Merkle proof.
+- **0G-anchored reputation**: a `TradeRecord` blob was written to 0G Storage and indexed against both your wallet and the MM's ENS name; future `history` calls fetch and verify it via Merkle proof.
 - **Atomic settlement**: `settle()` swapped both sides in a single contract call; no party could rug the other.
 
 ## How it works
@@ -130,7 +147,9 @@ Walking through the flow above exercises every load-bearing piece of the protoco
 - **Mini App** — Next.js + WalletConnect + injected (MetaMask/Rabby/Coinbase), runs inside Telegram or any browser. The only place a user's wallet ever signs. Source: `packages/miniapp/`.
 - **Identity** — MMs as ENS subnames under `parley.eth` on Sepolia ([`mm-1.parley.eth`](https://sepolia.app.ens.domains/mm-1.parley.eth) and [`mm-2.parley.eth`](https://sepolia.app.ens.domains/mm-2.parley.eth) are live with `addr` + `axl_pubkey` + `agent_capabilities` text records, and quote competing offers in the demo); users by wallet address.
 - **Reputation** — both MMs and users have on-chain-anchored reputation scores. See [Reputation](#reputation) below.
-- **Fallback** — direct Uniswap v3 (QuoterV2 + SwapRouter02 on Sepolia) when no peer offer arrives; the same on-chain quoter anchors the "vs Uniswap" delta shown on every peer offer.
+- **Smart routing** — the User Agent's planner compares pure-peer, pure-Uniswap, multi-MM split, and peer+Uniswap-tail shapes per intent and surfaces the best one. Multi-leg plans execute strict-serial: leg N+1 only starts after leg N settles on chain.
+- **Multi-token** — operators configure their MMs' supported pairs via `MM_TOKEN_ADDRESSES` + `MM_SUPPORTED_PAIRS`. The user-side agent recognizes any token by symbol (from a shared registry) or by inline contract address; pricing falls back to Uniswap when no MM supports a pair.
+- **Fallback** — direct Uniswap v3 (live `QuoterV2` + `SwapRouter02` on Sepolia) is always a baseline plan; the same on-chain quoter anchors the "vs Uniswap" delta shown on every peer offer (Phase 8).
 
 A trade end-to-end:
 
