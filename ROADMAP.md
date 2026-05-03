@@ -349,6 +349,51 @@ This phase is grounded in `deployment.md`, the working document that tracks depl
 
 ---
 
+## Phase 10 — Multi-token support (per-MM token allowlist)
+
+**Estimate:** 1–2 days
+**Tester readiness:** more visual variety in the demo — tokens beyond USDC/WETH
+
+**Goal:** lift the Phase-1 hardcoded USDC/WETH constraint. Each MM operator decides which tokens to fund and which pairs to quote on; the User Agent accepts arbitrary user-provided ERC20 addresses (validated on-chain) and routes through MMs that support the requested pair, falling back to Uniswap if none does.
+
+**Outcomes:**
+
+- [x] **Per-MM token registry from env.** New `packages/mm-agent/src/token-registry.ts` parses `MM_TOKEN_ADDRESSES` (`SYMBOL:address:decimals` tuples), `MM_SUPPORTED_PAIRS` (`SYMBOL/SYMBOL` allowlist), `MM_SPREAD_BPS_<SYM_A>_<SYM_B>` (per-pair spread overrides), and `MM_MIN_<SYMBOL>_RESERVE` per token. Backward-compat: when these are unset, falls back to the legacy USDC/WETH-only registry from `SEPOLIA_USDC_ADDRESS` / `SEPOLIA_WETH_ADDRESS`.
+
+- [x] **Generic Inventory.** `packages/mm-agent/src/inventory.ts` was refactored from `Inventory { usdc, weth }` to `Map<Hex, bigint>` keyed by lowercase token address. All helpers (`canFill`, `maxOutflow`, `reservedOutflows`, `applyReservations`, `fetchInventoryFromChain`, `loadReserveLimitsFromEnv`) are now pair-agnostic. Phase 9's reservation accounting still works — outflows are tracked per address in the same shape.
+
+- [x] **Pair-agnostic negotiator.** `pairFromIntent` consults the registry instead of hardcoded USDC/WETH; returns a structured `DeclineReason` (`unsupported_token` / `unsupported_pair` / `insufficient_balance`) on rejection so `handleIntent` can emit a precise `offer.decline` AXL message. `sizeDeal` math drops the `userInIsWeth` boolean — it now works for any (decimalsIn, decimalsOut) combination, including identical-decimals pairs.
+
+- [x] **Direction-aware spread.** Pre-Phase-10 the spread always increased the price; this was correct for USDC→WETH but inverted the direction for WETH→USDC (gave the user MORE USDC than mid). Phase 10 caches reference prices per-direction (`tokenOut per tokenIn × 1e18`) and the spread always REDUCES the price — so the user always gets less tokenOut than mid, regardless of direction. Fixes a latent asymmetry bug.
+
+- [x] **Multi-pair Uniswap reference cache.** `uniswap-reference.ts` now refreshes one cache entry per supported direction (each pair = 2 directions), all in parallel each cycle. Cache is keyed by `(tokenIn, tokenOut)`. Failures per-direction are independent — one stale pair doesn't block the others.
+
+- [x] **`mcp_parley_og_validate_token` tool.** New User Agent MCP tool reads `symbol()` + `decimals()` from a user-provided ERC20 address. Cached per-address. SOUL.md instructs the agent to validate non-canonical token addresses BEFORE building the Intent.
+
+- [x] **Multi-token intent syntax in SOUL.md.** Users can type `swap 10 USDC(0x1c7d...) for UNI(0x1789...)` with explicit address tags. Agent validates each address with the new tool, hand-builds the Intent envelope with the validated `TokenRef`s, signs and broadcasts. MMs that don't support the requested pair decline; if none do, agent falls through to Uniswap fallback with an explanatory note.
+
+**Out of scope (post-Phase-10):**
+
+- **ENS `agent_capabilities` self-heal.** The MM doesn't write its current registry to its ENS subname's `agent_capabilities` text record on every boot. Operators re-run `pnpm phase3:register-mm` if they change `MM_SUPPORTED_PAIRS` and want the User Agent's pre-filter (when added) to know. Functionally OK for now since unsupported pairs decline cleanly via `offer.decline`.
+- **Multi-hop Uniswap routing.** When no direct v3 pool exists for the user's pair, the Uniswap fallback fails. Currently no auto-bridging through ETH/USDC. If the User Agent's planner can't find a peer or a direct fallback, the agent tells the user the pair isn't tradable on Sepolia.
+- **Pre-broadcast pair filter.** User Agent broadcasts to all known MMs; relies on `offer.decline` to handle non-supporting MMs. A pre-filter via ENS `agent_capabilities` reads is possible but adds discovery latency for marginal benefit.
+- **Mini App symbol display.** The Mini App still doesn't read `symbol()` at render time; it shows the address+symbol from the deal struct as-is. Adding chain reads to the client is a polish item.
+- **Adaptive spread per-pair-depth.** `MM_SPREAD_BPS_<SYM>_<SYM>` is operator-configured static. A real MM would adjust spreads to pool depth and volatility. Listed under SPEC §11.4 long-term.
+
+**Verification:**
+
+- [ ] **Single-pair fallback works.** With `MM_TOKEN_ADDRESSES` and `MM_SUPPORTED_PAIRS` unset, the MM boots with the legacy USDC/WETH registry derived from `SEPOLIA_*_ADDRESS`. Existing USDC/WETH demo flows continue to work.
+- [ ] **Multi-token registry parses correctly.** With `MM_TOKEN_ADDRESSES=USDC:0x1c7d...:6,WETH:0xfff9...:18,UNI:0x1789...:18` and `MM_SUPPORTED_PAIRS=USDC/WETH,USDC/UNI`, the boot log shows `supported_pairs: ["USDC/WETH","USDC/UNI"]` and per-token balances/reserves.
+- [ ] **Unsupported pair declines cleanly.** Send a `WETH/UNI` intent (token in registry but pair not in allowlist). MM logs `offer_declined`, `reason: "unsupported_pair"` and emits the AXL decline.
+- [ ] **Unsupported token declines cleanly.** Send an intent with a random ERC20 address not in `MM_TOKEN_ADDRESSES`. MM logs `offer_declined`, `reason: "unsupported_token"`.
+- [ ] **Direction-aware spread works for both directions.** With `MM_SPREAD_BPS_USDC_WETH=10`, a USDC→WETH intent and a WETH→USDC intent both produce offers ~10 bps WORSE than the cached mid (user gets less tokenOut in both cases).
+- [ ] **`validate_token` rejects garbage addresses.** Calling the tool with a random non-contract address returns `{ ok: false, error }` and the agent doesn't broadcast.
+- [ ] **Cross-package typecheck + build clean.**
+
+**Demoable state:** the agent can swap USDC↔WETH, USDC↔UNI, WETH↔UNI on Sepolia (or any operator-configured pairs). MM operators decide per-deployment which tokens they fund and quote — Parley's marketplace is no longer a fixed two-token demo.
+
+---
+
 ## Risk register
 
 Things that could derail the build, with mitigations. Listed in approximate order of "this is the one I'd be most worried about."

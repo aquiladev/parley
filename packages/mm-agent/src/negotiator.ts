@@ -4,7 +4,7 @@
 import { randomUUID } from "node:crypto";
 import { encodeFunctionData, parseAbi, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import type { DealTerms, Intent, Offer, TokenRef } from "@parley/shared";
+import type { DealTerms, Intent, Offer } from "@parley/shared";
 
 import {
   canFill,
@@ -13,7 +13,7 @@ import {
   type InventoryLimits,
 } from "./inventory.js";
 import { dealForSigning, dealHash, DEAL_TYPES } from "./eip712.js";
-import { quote } from "./pricing.js";
+import type { MmTokenRegistry, SupportedToken } from "./token-registry.js";
 import type { MmWallet } from "./wallet.js";
 
 const SETTLEMENT_ABI = parseAbi([
@@ -21,18 +21,19 @@ const SETTLEMENT_ABI = parseAbi([
 ]);
 
 export interface NegotiatorConfig {
-  mmEnsName: string; // human label only in Phase 1; ENS resolution lands in Phase 3
+  mmEnsName: string;
   mmAddress: Hex;
-  spreadBps: number;
   settlementContract: Hex;
   chainId: number;
   privateKey: Hex;
-  /** Reserve floors per token. Quotes that would push a token below its
-   *  reserve are skipped. Default 0 / 0. Inventory is NOT cached here — it's
-   *  fetched live from chain per-intent and passed into `buildOffer`. */
+  /** Reserve floors per token, address-keyed. Quotes that would push a
+   *  token below its reserve are skipped. Inventory is NOT cached here —
+   *  it's fetched live from chain per-intent and passed into `buildOffer`. */
   limits: InventoryLimits;
-  /** Tokens the MM is willing to quote in. Phase 1: USDC + WETH. */
-  knownTokens: { usdc: TokenRef; weth: TokenRef };
+  /** Phase 10: per-MM token + pair allowlist with per-pair spread
+   *  overrides. Replaces the hardcoded knownTokens.{usdc,weth} +
+   *  spreadBps fields. */
+  registry: MmTokenRegistry;
   offerExpiryMs: number;
   settlementWindowMs: number;
 }
@@ -42,7 +43,7 @@ export interface PreparedOffer {
   deal: DealTerms;
   /** Outflow this offer commits us to (so the main loop can debit inventory
    *  on accept). */
-  outflow: { token: keyof Inventory; amount: bigint };
+  outflow: { token: Hex; amount: bigint };
   /** Phase 9: true when this offer covers less than the user's full
    *  intent amount because inventory wasn't deep enough. The wire-format
    *  Offer doesn't carry a `partial` flag; the User Agent detects it by
@@ -51,61 +52,78 @@ export interface PreparedOffer {
   partial: boolean;
 }
 
+/** Phase 10: structured decline reason so handleIntent can route to the
+ *  right log/decline message. Matches the `reason` strings the MM emits
+ *  on `offer.decline` AXL messages. */
+export type DeclineReason =
+  | "unsupported_token"
+  | "unsupported_pair"
+  | "insufficient_balance"
+  | "price_unavailable"; // emitted by index.ts before reaching buildOffer
+
 /** Decide whether to quote on `intent`, build a Deal, return the wire-form
  *  Offer + the Deal both parties will sign on-chain. `inventory` is the
  *  AVAILABLE inventory after subtracting the MM's reserve floor and any
- *  in-flight reservations from prior offers — the caller in `index.ts`
- *  applies both before invoking this function. `referenceTwap1e18` is
- *  the current Uniswap mid-price for the pair (USDC per WETH × 1e18),
- *  pulled from the synchronously-readable cache in `uniswap-reference.ts`.
- *  Both inventory accounting and reference staleness checks happen at
- *  the call site so this function stays sync + pure.
+ *  in-flight reservations from prior offers (caller in `index.ts` applies
+ *  both before invoking). `referencePrice1e18` is the current Uniswap
+ *  mid-price for THIS direction (`tokenOut natural units per 1 tokenIn
+ *  natural unit × 1e18`) from the per-direction cache. The caller is
+ *  responsible for the staleness check.
  *
- *  Phase 9: if `inventory` doesn't cover the full intent at the MM's
- *  spread, we now SIZE DOWN to whatever we can fill (returning a partial
- *  Offer) instead of declining. The wire-format Offer doesn't carry a
- *  `partial` flag — the User Agent detects partial-fill by comparing
- *  `offer.deal.amountA < intent.amount` (input-token wei). Only when
- *  the available inventory is effectively zero do we still return null
- *  (caller emits the existing Phase 8b decline message).
+ *  Phase 10: pair eligibility is checked via the MM's registry (token
+ *  addresses configured by the operator + supported-pairs allowlist).
+ *  Returns either a `PreparedOffer` or a `DeclineReason` so the caller
+ *  can emit a precise `offer.decline` AXL message.
  */
 export function buildOffer(
   intent: Intent,
   inventory: Inventory,
-  referenceTwap1e18: bigint,
+  referencePrice1e18: bigint,
   cfg: NegotiatorConfig,
-): PreparedOffer | null {
-  const pair = pairFromIntent(intent, cfg);
-  if (!pair) return null;
+): PreparedOffer | DeclineReason {
+  const pair = pairFromIntent(intent, cfg.registry);
+  if (pair === "unsupported_token" || pair === "unsupported_pair") return pair;
 
   const intentAmount = parseDecimal(intent.amount, pair.userInToken.decimals);
-  const ourPrice = quote({ uniswap_twap: referenceTwap1e18, spread_bps: cfg.spreadBps });
+  const spreadBps = cfg.registry.getSpreadBps(
+    pair.userInToken.address,
+    pair.userOutToken.address,
+  );
+  // Phase 10 spread convention: the cached price is "tokenOut per
+  // tokenIn × 1e18" for the user's direction, and the spread always
+  // makes the user-effective rate WORSE (less tokenOut per tokenIn).
+  // So we DECREASE the price by the spread, regardless of which two
+  // tokens are involved. This fixes the directional asymmetry the
+  // pre-Phase-10 code had when the user was selling WETH for USDC.
+  const ourPrice = applyAdverseSpread(referencePrice1e18, spreadBps);
 
-  // Outflow token is what the MM gives out — the user's OUT token.
-  const outflowToken: keyof Inventory = pair.userInIsWeth ? "usdc" : "weth";
-  const outflowCeiling = maxOutflow(inventory, cfg.limits, outflowToken);
-  if (outflowCeiling === 0n) return null; // nothing available — caller emits decline
+  const outflowCeiling = maxOutflow(
+    inventory,
+    cfg.limits,
+    pair.userOutToken.address,
+  );
+  if (outflowCeiling === 0n) return "insufficient_balance";
 
   const sizing = sizeDeal({
-    userInIsWeth: pair.userInIsWeth,
     amountIn: intentAmount,
-    priceUsdcPerWeth1e18: ourPrice,
-    usdcDecimals: cfg.knownTokens.usdc.decimals,
-    wethDecimals: cfg.knownTokens.weth.decimals,
+    pricePer1TokenIn1e18: ourPrice,
+    decimalsIn: pair.userInToken.decimals,
+    decimalsOut: pair.userOutToken.decimals,
     maxOutflowB: outflowCeiling,
   });
 
   // Pathological case: ceiling so small the back-derived amountA rounds
   // to zero. Decline rather than emit a zero-amount offer.
-  if (sizing.amountA === 0n || sizing.amountB === 0n) return null;
+  if (sizing.amountA === 0n || sizing.amountB === 0n) {
+    return "insufficient_balance";
+  }
 
   const outflow = {
-    token: outflowToken,
+    token: pair.userOutToken.address,
     amount: sizing.amountB,
   };
-  // Defense-in-depth: sizing already respected the ceiling, so this should
-  // always pass. Keeps the safety property explicit.
-  if (!canFill(inventory, cfg.limits, outflow)) return null;
+  // Defense-in-depth: sizing already respected the ceiling.
+  if (!canFill(inventory, cfg.limits, outflow)) return "insufficient_balance";
 
   const deadline = Math.floor(Date.now() / 1000) + Math.floor(cfg.offerExpiryMs / 1000);
   const nonce = nonceFromIntent(intent.id);
@@ -133,7 +151,9 @@ export function buildOffer(
     intent_id: intent.id,
     mm_agent_id: cfg.mmAddress,
     mm_ens_name: cfg.mmEnsName,
-    price: formatPriceUsdcPerWeth(ourPrice),
+    // Pair-agnostic price expression: "<tokenOut symbol> per <tokenIn symbol>"
+    // formatted as a decimal string.
+    price: formatPricePerTokenIn(ourPrice, pair.userInToken, pair.userOutToken),
     amount: amountHuman,
     expiry: deadline,
     settlement_window_ms: cfg.settlementWindowMs,
@@ -143,6 +163,16 @@ export function buildOffer(
   };
 
   return { offer, deal, outflow, partial: sizing.partial };
+}
+
+/** Phase 10: spread always makes the user's effective rate WORSE (less
+ *  tokenOut per tokenIn given). Direction-symmetric since the cached
+ *  reference is per-direction. */
+function applyAdverseSpread(referencePrice1e18: bigint, spreadBps: number): bigint {
+  // (1 - bps/10000) — clamps spread to [0, 9999] to avoid pathological
+  // negative or zero prices on operator misconfiguration.
+  const safeBps = Math.max(0, Math.min(9999, spreadBps));
+  return (referencePrice1e18 * BigInt(10000 - safeBps)) / 10000n;
 }
 
 /** Sign the Deal struct with the MM's hot wallet (EIP-712). */
@@ -213,81 +243,91 @@ export function digest(deal: DealTerms, cfg: NegotiatorConfig): Hex {
 
 interface PairResolution {
   /** What the user is sending us. */
-  userInToken: TokenRef;
+  userInToken: SupportedToken;
   /** What we owe back to the user. */
-  userOutToken: TokenRef;
-  /** True iff userInToken is WETH. (Phase 1: only USDC + WETH supported.) */
-  userInIsWeth: boolean;
+  userOutToken: SupportedToken;
 }
 
+/** Resolve the user's intent against the MM's registry. Returns either a
+ *  resolved pair (both tokens recognized + the unordered pair allowlisted)
+ *  or a `DeclineReason` so the caller can emit a precise decline message. */
 function pairFromIntent(
   intent: Intent,
-  cfg: NegotiatorConfig,
-): PairResolution | null {
-  const usdc = cfg.knownTokens.usdc;
-  const weth = cfg.knownTokens.weth;
-  const { base, quote: q } = intent;
-
-  const baseIsUsdc = sameToken(base, usdc);
-  const baseIsWeth = sameToken(base, weth);
-  const quoteIsUsdc = sameToken(q, usdc);
-  const quoteIsWeth = sameToken(q, weth);
-  if (!((baseIsUsdc && quoteIsWeth) || (baseIsWeth && quoteIsUsdc))) return null;
-
+  registry: MmTokenRegistry,
+): PairResolution | "unsupported_token" | "unsupported_pair" {
+  const baseInfo = registry.getToken(intent.base.address as Hex);
+  const quoteInfo = registry.getToken(intent.quote.address as Hex);
+  if (!baseInfo || !quoteInfo) return "unsupported_token";
+  if (!registry.isSupportedPair(baseInfo.address, quoteInfo.address)) {
+    return "unsupported_pair";
+  }
   // intent.side === "sell": user sends `base`, wants `quote` back.
   // intent.side === "buy":  user wants `base`, sends `quote`.
-  const userInToken = intent.side === "sell" ? base : q;
-  const userOutToken = intent.side === "sell" ? q : base;
-  return { userInToken, userOutToken, userInIsWeth: sameToken(userInToken, weth) };
+  const userInToken = intent.side === "sell" ? baseInfo : quoteInfo;
+  const userOutToken = intent.side === "sell" ? quoteInfo : baseInfo;
+  return { userInToken, userOutToken };
 }
 
-function sameToken(a: TokenRef, b: TokenRef): boolean {
-  return (
-    a.chain_id === b.chain_id &&
-    a.address.toLowerCase() === b.address.toLowerCase()
-  );
-}
-
+/** Phase 10: pair-agnostic sizing. `pricePer1TokenIn1e18` represents
+ *  "tokenOut natural units per 1 tokenIn natural unit, scaled to 1e18".
+ *  The decimal handling is symmetric — works for any (decimalsIn,
+ *  decimalsOut) combination, including identical decimals (e.g.,
+ *  USDC/USDT both at 6) and inverted directions (WETH/USDC vs USDC/WETH).
+ *
+ *  Forward formula:
+ *    amountOut_wei = (amountIn_wei × price × 10^(decOut - decIn)) / 10^18
+ *  When `decOut < decIn`, the 10^(decOut-decIn) factor is negative; we
+ *  flip to a divisor to keep bigint exponentiation valid.
+ */
 function sizeDeal(opts: {
-  userInIsWeth: boolean;
   amountIn: bigint;
-  priceUsdcPerWeth1e18: bigint;
-  usdcDecimals: number;
-  wethDecimals: number;
-  /** Phase 9: cap on amountB (the MM's outflow), in tokenB wei. When the
-   *  forward-computed amountB would exceed this, both amountB and the
-   *  back-derived amountA are scaled down to fit — yielding a partial
-   *  offer rather than a decline. */
+  pricePer1TokenIn1e18: bigint;
+  decimalsIn: number;
+  decimalsOut: number;
+  /** Cap on amountB (the MM's outflow), in tokenOut wei. Phase 9
+   *  partial-fill: when the forward-computed amountB exceeds this, both
+   *  amountB and the back-derived amountA are scaled down to fit. */
   maxOutflowB: bigint;
 }): { amountA: bigint; amountB: bigint; partial: boolean } {
-  const { userInIsWeth, amountIn, priceUsdcPerWeth1e18: price, maxOutflowB } = opts;
-  const dDelta = BigInt(opts.wethDecimals - opts.usdcDecimals); // 12 for USDC(6)/WETH(18)
+  const { amountIn, pricePer1TokenIn1e18: price, decimalsIn, decimalsOut, maxOutflowB } = opts;
   const SCALE = 10n ** 18n;
+  const dDelta = decimalsOut - decimalsIn; // signed
 
-  if (userInIsWeth) {
-    // user gives WETH (18dp), MM owes USDC (6dp): amountB = amountIn * price / 1e18 / 10^dDelta
-    let amountA = amountIn;
-    let amountB = (amountA * price) / SCALE / 10n ** dDelta;
-    let partial = false;
-    if (amountB > maxOutflowB) {
-      amountB = maxOutflowB;
-      // Inverse of the forward formula: amountA = amountB * SCALE * 10^dDelta / price
-      amountA = (amountB * SCALE * 10n ** dDelta) / price;
-      partial = true;
-    }
-    return { amountA, amountB, partial };
-  }
-  // user gives USDC (6dp), MM owes WETH (18dp): amountB = amountIn * 1e18 * 10^dDelta / price
   let amountA = amountIn;
-  let amountB = (amountA * SCALE * 10n ** dDelta) / price;
+  let amountB = forwardConvert(amountA, price, dDelta, SCALE);
   let partial = false;
   if (amountB > maxOutflowB) {
     amountB = maxOutflowB;
-    // Inverse of the forward formula: amountA = amountB * price / SCALE / 10^dDelta
-    amountA = (amountB * price) / SCALE / 10n ** dDelta;
+    // Inverse: amountA = amountB × SCALE / (price × 10^dDelta)  if dDelta >= 0
+    //          amountA = (amountB × SCALE × 10^(-dDelta)) / price  if dDelta < 0
+    amountA = inverseConvert(amountB, price, dDelta, SCALE);
     partial = true;
   }
   return { amountA, amountB, partial };
+}
+
+function forwardConvert(
+  amountInWei: bigint,
+  price1e18: bigint,
+  dDelta: number,
+  SCALE: bigint,
+): bigint {
+  if (dDelta >= 0) {
+    return (amountInWei * price1e18 * 10n ** BigInt(dDelta)) / SCALE;
+  }
+  return (amountInWei * price1e18) / SCALE / 10n ** BigInt(-dDelta);
+}
+
+function inverseConvert(
+  amountOutWei: bigint,
+  price1e18: bigint,
+  dDelta: number,
+  SCALE: bigint,
+): bigint {
+  if (dDelta >= 0) {
+    return (amountOutWei * SCALE) / (price1e18 * 10n ** BigInt(dDelta));
+  }
+  return (amountOutWei * SCALE * 10n ** BigInt(-dDelta)) / price1e18;
 }
 
 function parseDecimal(human: string, decimals: number): bigint {
@@ -296,11 +336,20 @@ function parseDecimal(human: string, decimals: number): bigint {
   return BigInt((whole ?? "0") + fracPadded);
 }
 
-function formatPriceUsdcPerWeth(price1e18: bigint): string {
+/** Format a `tokenOut per tokenIn × 1e18` price as a human-readable
+ *  decimal string, with a brief `<symOut>/<symIn>` suffix the agent can
+ *  surface in chat (e.g. "8221.81 USDC/WETH"). 6 fractional digits is
+ *  enough resolution for any pair we'll quote on testnet. */
+function formatPricePerTokenIn(
+  price1e18: bigint,
+  tokenIn: SupportedToken,
+  tokenOut: SupportedToken,
+): string {
   const whole = price1e18 / 10n ** 18n;
   const frac = price1e18 % 10n ** 18n;
   const fracStr = frac.toString().padStart(18, "0").slice(0, 6).replace(/0+$/, "");
-  return fracStr ? `${whole}.${fracStr}` : `${whole}`;
+  const num = fracStr ? `${whole}.${fracStr}` : `${whole}`;
+  return `${num} ${tokenOut.symbol}/${tokenIn.symbol}`;
 }
 
 /** Format an integer wei amount as a human decimal string. Trims trailing

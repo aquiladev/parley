@@ -290,50 +290,51 @@ server.registerTool(
   "write_trade_record",
   {
     description:
-      "Upload a TradeRecord blob to 0G Storage (returns the Merkle root hash) and add it to the local indices for both the user wallet and the MM ENS name. Called by both agents after every trade outcome (settled / failed / timed-out) per SPEC §7.1. Caller is responsible for providing the MM's ens_name explicitly so we can index by it (the record itself only carries wallet addresses).",
+      "Queue a TradeRecord for upload to 0G Storage and indexing under the user's wallet address + MM's ENS name. Returns immediately with `{ ok: true, status: 'queued' }` — the actual upload happens in the background because 0G testnet uploads can take minutes (storage node sync), longer than Hermes' MCP tool-call timeout. Per SPEC §7.1, this is fire-and-forget by design: the user has already seen 'settled ✓' on chain by this point, and a missed write costs at most one trade's worth of reputation signal. Caller passes mm_ens_name explicitly so we can index by it (the record itself only carries wallet addresses).",
     inputSchema: {
       record: TradeRecordSchema,
       mm_ens_name: z.string(),
     },
   },
   async ({ record, mm_ens_name }) => {
-    try {
-      const rootHash = await uploadTradeRecord(record as TradeRecord);
-      appendUserRecord(record.user_agent, rootHash);
-      appendMMRecord(mm_ens_name, rootHash);
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                ok: true,
-                trade_id: record.trade_id,
-                root_hash: rootHash,
-                indexed_for_user: record.user_agent.toLowerCase(),
-                indexed_for_mm: mm_ens_name,
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
-    } catch (err) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              { error: "upload_failed", message: (err as Error).message },
-              null,
-              2,
-            ),
-          },
-        ],
-        isError: true,
-      };
-    }
+    // Fire-and-forget: kick off upload + indexing in the background so the
+    // tool call returns within milliseconds. Hermes' MCP transport has a
+    // ~60s tool-call timeout; awaiting a 0G upload here turns a successful
+    // settled trade into a user-visible "trade record write timed out"
+    // error. Logs both success and failure on stderr so the operator can
+    // audit drops.
+    void (async () => {
+      try {
+        const rootHash = await uploadTradeRecord(record as TradeRecord);
+        appendUserRecord(record.user_agent, rootHash);
+        appendMMRecord(mm_ens_name, rootHash);
+        process.stderr.write(
+          `[og-mcp] trade_record_uploaded trade_id=${record.trade_id} root_hash=${rootHash} mm=${mm_ens_name}\n`,
+        );
+      } catch (err) {
+        process.stderr.write(
+          `[og-mcp] trade_record_upload_failed trade_id=${record.trade_id} mm=${mm_ens_name} err=${(err as Error).message}\n`,
+        );
+      }
+    })();
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              ok: true,
+              status: "queued",
+              trade_id: record.trade_id,
+              indexed_for_user: record.user_agent.toLowerCase(),
+              indexed_for_mm: mm_ens_name,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
   },
 );
 
@@ -514,6 +515,98 @@ const SETTLEMENT_STATE_NAMES = [
 const USDC_ADDRESS = process.env["SEPOLIA_USDC_ADDRESS"] as Hex | undefined;
 const WETH_ADDRESS = process.env["SEPOLIA_WETH_ADDRESS"] as Hex | undefined;
 
+interface BalanceToken {
+  symbol: string;
+  address: Hex;
+  decimals: number;
+}
+
+/** Phase 10: multi-token balance registry. Combines:
+ *  - Legacy SEPOLIA_USDC_ADDRESS / SEPOLIA_WETH_ADDRESS (always included
+ *    when set, for backward compat with single-pair deployments)
+ *  - MM_TOKEN_ADDRESSES (the MM operator's allowlist; the user-agent
+ *    typically shares the same .env so this transparently surfaces any
+ *    Phase 10 multi-token config)
+ *  - KNOWN_TOKENS — a User-Agent-specific override if the operator wants
+ *    a different list for /balance display than the MMs quote on. Same
+ *    SYMBOL:address:decimals,… format as MM_TOKEN_ADDRESSES.
+ *  Tokens are deduped by lowercase address; the first occurrence wins.
+ */
+function loadBalanceTokens(): BalanceToken[] {
+  const out: BalanceToken[] = [];
+  const seen = new Set<string>();
+  const push = (sym: string, addr: string, decimals: number) => {
+    const lower = addr.toLowerCase();
+    if (seen.has(lower)) return;
+    seen.add(lower);
+    out.push({ symbol: sym, address: lower as Hex, decimals });
+  };
+  // Legacy canonical addresses
+  if (USDC_ADDRESS) push("USDC", USDC_ADDRESS, 6);
+  if (WETH_ADDRESS) push("WETH", WETH_ADDRESS, 18);
+  // Multi-token registry (operator config). Same parser shape as
+  // packages/mm-agent/src/token-registry.ts.
+  for (const envKey of ["KNOWN_TOKENS", "MM_TOKEN_ADDRESSES"]) {
+    const raw = process.env[envKey];
+    if (!raw || raw.trim() === "") continue;
+    for (const entry of raw.split(",")) {
+      const parts = entry.trim().split(":");
+      if (parts.length !== 3) continue;
+      const [sym, addr, dec] = parts as [string, string, string];
+      if (!/^0x[0-9a-fA-F]{40}$/.test(addr)) continue;
+      const decimals = Number(dec);
+      if (!Number.isInteger(decimals) || decimals < 0 || decimals > 30) continue;
+      push(sym.trim(), addr, decimals);
+    }
+  }
+  return out;
+}
+
+const BALANCE_TOKENS: readonly BalanceToken[] = loadBalanceTokens();
+
+// Symbol-keyed lookup, uppercased so case-insensitive matching works.
+// Registry overlap: if the operator configures multiple addresses with
+// the same symbol, the first occurrence in BALANCE_TOKENS wins (same
+// rule as deduping by address in loadBalanceTokens).
+const TOKEN_BY_SYMBOL_INDEX: ReadonlyMap<string, BalanceToken> = (() => {
+  const m = new Map<string, BalanceToken>();
+  for (const t of BALANCE_TOKENS) {
+    const key = t.symbol.toUpperCase();
+    if (!m.has(key)) m.set(key, t);
+  }
+  return m;
+})();
+
+server.registerTool(
+  "list_known_tokens",
+  {
+    description:
+      "Return the full operator-configured token registry on Sepolia: every ERC20 the User Agent recognizes by symbol, with its address and decimals. Sources combined: SEPOLIA_USDC_ADDRESS / SEPOLIA_WETH_ADDRESS, MM_TOKEN_ADDRESSES (the MM operator's allowlist), and KNOWN_TOKENS (User-Agent override). **Use this before refusing a swap on a non-canonical symbol.** When the user types `swap N FOO for BAR` and FOO or BAR isn't in {USDC, WETH, ETH}, call this tool — if the symbol is in the registry, use its address+decimals to build the Intent (Phase 10 multi-token mode). Only ask the user for an explicit address when the symbol is genuinely unknown. Returns { ok: true, tokens: [{ symbol, address, decimals }, ...] }.",
+    inputSchema: {},
+  },
+  async () => {
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              ok: true,
+              tokens: BALANCE_TOKENS.map((t) => ({
+                symbol: t.symbol,
+                address: t.address,
+                decimals: t.decimals,
+              })),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
 const ERC20_BALANCE_ABI = parseAbi([
   "function balanceOf(address) view returns (uint256)",
   "function decimals() view returns (uint8)",
@@ -598,21 +691,21 @@ server.registerTool(
   },
 );
 
-// /balance command surface. Reads native ETH + the two ERC20 tokens Parley
-// trades on Sepolia (USDC, WETH) in one call. Returns both wei (string, for
-// precise comparisons) and human-formatted decimals so the agent can render
-// without doing math.
+// /balance command surface. Reads native ETH + every ERC20 the operator
+// configured (legacy USDC/WETH + Phase 10 MM_TOKEN_ADDRESSES /
+// KNOWN_TOKENS). Returns both wei (string, for precise comparisons) and
+// human-formatted decimals so the agent can render without doing math.
 server.registerTool(
   "read_wallet_balance",
   {
     description:
-      "Read a wallet's native ETH and ERC20 (USDC, WETH) balances on Sepolia. Use this for the /balance command. Returns { ok: true, wallet, balances: { eth: { wei, formatted }, usdc: { wei, formatted, decimals: 6, address }, weth: { wei, formatted, decimals: 18, address } } }. Cheap (one eth_getBalance + two eth_call). On RPC failure returns { ok: false, error }.",
+      "Read a wallet's native ETH and ERC20 balances on Sepolia. Use this for the `balance` command. Returns { ok: true, wallet, balances: { eth: { wei, formatted, decimals: 18 }, tokens: [{ symbol, address, decimals, wei, formatted }, ...] } }. The `tokens` array enumerates every token in the operator's registry (legacy SEPOLIA_USDC_ADDRESS / SEPOLIA_WETH_ADDRESS plus MM_TOKEN_ADDRESSES / KNOWN_TOKENS multi-token entries) — order preserved, dedup'd by address. Surface every entry to the user; don't only read the canonical pair. On RPC failure returns { ok: false, error }.",
     inputSchema: {
       wallet: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
     },
   },
   async ({ wallet }) => {
-    if (!USDC_ADDRESS || !WETH_ADDRESS) {
+    if (BALANCE_TOKENS.length === 0) {
       return {
         content: [
           {
@@ -621,7 +714,7 @@ server.registerTool(
               {
                 ok: false,
                 error:
-                  "SEPOLIA_USDC_ADDRESS / SEPOLIA_WETH_ADDRESS not set in og-mcp env (check hermes-config/config.yaml mcp_servers.parley_og.env)",
+                  "no token registry configured: set SEPOLIA_USDC_ADDRESS / SEPOLIA_WETH_ADDRESS, MM_TOKEN_ADDRESSES, or KNOWN_TOKENS in og-mcp env (check hermes-config/config.yaml mcp_servers.parley_og.env)",
               },
               null,
               2,
@@ -633,21 +726,24 @@ server.registerTool(
     }
     const addr = wallet as Hex;
     try {
-      const [ethWei, usdcWei, wethWei] = await Promise.all([
+      const [ethWei, ...tokenWeis] = await Promise.all([
         client.getBalance({ address: addr }),
-        client.readContract({
-          address: USDC_ADDRESS,
-          abi: ERC20_BALANCE_ABI,
-          functionName: "balanceOf",
-          args: [addr],
-        }) as Promise<bigint>,
-        client.readContract({
-          address: WETH_ADDRESS,
-          abi: ERC20_BALANCE_ABI,
-          functionName: "balanceOf",
-          args: [addr],
-        }) as Promise<bigint>,
+        ...BALANCE_TOKENS.map((t) =>
+          client.readContract({
+            address: t.address,
+            abi: ERC20_BALANCE_ABI,
+            functionName: "balanceOf",
+            args: [addr],
+          }) as Promise<bigint>,
+        ),
       ]);
+      const tokens = BALANCE_TOKENS.map((t, i) => ({
+        symbol: t.symbol,
+        address: t.address,
+        decimals: t.decimals,
+        wei: (tokenWeis[i] ?? 0n).toString(),
+        formatted: formatUnits(tokenWeis[i] ?? 0n, t.decimals),
+      }));
       return {
         content: [
           {
@@ -657,19 +753,12 @@ server.registerTool(
                 ok: true,
                 wallet: addr,
                 balances: {
-                  eth: { wei: ethWei.toString(), formatted: formatUnits(ethWei, 18), decimals: 18 },
-                  usdc: {
-                    wei: usdcWei.toString(),
-                    formatted: formatUnits(usdcWei, 6),
-                    decimals: 6,
-                    address: USDC_ADDRESS,
-                  },
-                  weth: {
-                    wei: wethWei.toString(),
-                    formatted: formatUnits(wethWei, 18),
+                  eth: {
+                    wei: ethWei.toString(),
+                    formatted: formatUnits(ethWei, 18),
                     decimals: 18,
-                    address: WETH_ADDRESS,
                   },
+                  tokens,
                 },
               },
               null,
@@ -685,6 +774,94 @@ server.registerTool(
             type: "text",
             text: JSON.stringify(
               { ok: false, wallet: addr, error: (err as Error).message },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
+// Phase 10: ERC20 metadata validator. The user types
+// `swap 10 USDC(0x1c7d...) for UNI(0x1789...)`; the agent calls this to
+// (a) confirm the address is actually an ERC20 (decimals() succeeds),
+// (b) read symbol() + decimals() so the Intent's TokenRefs are correct,
+// (c) reject obviously-bad addresses early instead of broadcasting a
+// malformed intent that every MM will silently decline.
+//
+// Cached per-address for the process lifetime since ERC20 metadata is
+// immutable. Cache miss is a single RPC; warm cache is O(1).
+
+const TOKEN_METADATA_CACHE = new Map<string, {
+  address: Hex;
+  symbol: string;
+  decimals: number;
+}>();
+
+const ERC20_METADATA_ABI = parseAbi([
+  "function symbol() view returns (string)",
+  "function decimals() view returns (uint8)",
+]);
+
+server.registerTool(
+  "validate_token",
+  {
+    description:
+      "Read symbol() and decimals() from an ERC20 contract on Sepolia and confirm the address is a valid token. Use BEFORE constructing an Intent for any non-canonical token (i.e., anything beyond USDC/WETH that the user provides via `swap N FOO(0xaddr...) for BAR(0xaddr...)` syntax). Returns { ok: true, address, symbol, decimals } on success, { ok: false, error } if the contract doesn't exist or doesn't implement the ERC20 metadata interface. Cached per-address.",
+    inputSchema: {
+      address: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
+    },
+  },
+  async ({ address }) => {
+    const addr = address.toLowerCase() as Hex;
+    const cached = TOKEN_METADATA_CACHE.get(addr);
+    if (cached) {
+      return {
+        content: [
+          { type: "text", text: JSON.stringify({ ok: true, ...cached }, null, 2) },
+        ],
+      };
+    }
+    try {
+      const [symbol, decimals] = await Promise.all([
+        client.readContract({
+          address: addr,
+          abi: ERC20_METADATA_ABI,
+          functionName: "symbol",
+        }) as Promise<string>,
+        client.readContract({
+          address: addr,
+          abi: ERC20_METADATA_ABI,
+          functionName: "decimals",
+        }) as Promise<number>,
+      ]);
+      const meta = {
+        address: addr,
+        symbol: String(symbol),
+        decimals: Number(decimals),
+      };
+      TOKEN_METADATA_CACHE.set(addr, meta);
+      return {
+        content: [
+          { type: "text", text: JSON.stringify({ ok: true, ...meta }, null, 2) },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ok: false,
+                address: addr,
+                error: (err as Error).message,
+                hint:
+                  "Address may not be a contract, may not implement ERC20 metadata (symbol/decimals), or RPC is failing.",
+              },
               null,
               2,
             ),
@@ -718,18 +895,36 @@ server.registerTool(
 // All numeric values returned as decimal strings (bigints don't survive
 // JSON serialization).
 
+interface LegDisplay {
+  /** Decimal-formatted amount the user gives on this leg (e.g., "0.05"). */
+  amount_in: string;
+  /** Decimal-formatted amount the user receives on this leg. */
+  amount_out: string;
+  /** Token symbol for the input side. */
+  token_in_symbol: string;
+  /** Token symbol for the output side. */
+  token_out_symbol: string;
+}
+
 interface PeerLeg {
   source: "peer";
   offer: Offer;
+  /** WEI amounts — for the planner's internal math + downstream chain
+   *  calls. **Do NOT use these as display strings or URL params**; use
+   *  `display.amount_in` / `display.amount_out` instead. */
   amount_in_wei: string;
   amount_out_wei: string;
+  display: LegDisplay;
 }
 
 interface UniswapLeg {
   source: "uniswap";
   prepared: PreparedFallbackSwap;
+  /** WEI amounts — internal only. The prepared.expectedInput /
+   *  expectedOutput fields carry the same values as decimal strings. */
   amount_in_wei: string;
   amount_out_wei: string;
+  display: LegDisplay;
 }
 
 type Leg = PeerLeg | UniswapLeg;
@@ -842,24 +1037,33 @@ async function computeRoutingPlan(
     return lhs > rhs ? -1 : lhs < rhs ? 1 : 0;
   });
 
-  // Greedy peer fill
+  // Greedy peer fill. **Only takes WHOLE offers**: a peer offer's deal
+  // struct is signed by the MM with EXACT amountA/amountB, so we cannot
+  // legitimately take only a fraction of it on-chain. If an offer is
+  // larger than the remaining unfilled amount, we skip it (the user
+  // would otherwise lock more than they wanted). The Uniswap tail
+  // covers any leftover.
   const peerLegs: PeerLeg[] = [];
   let remaining = intentAmountWei;
   for (const offer of sorted) {
     if (remaining === 0n) break;
     const offerAmountA = BigInt(offer.deal.amountA);
-    const take = offerAmountA < remaining ? offerAmountA : remaining;
-    if (take < minLegWei) continue;
-    // Output proportional to input within this offer (peer rate is fixed).
+    if (offerAmountA > remaining) continue; // can't take a fraction of a signed deal
+    if (offerAmountA < minLegWei) continue; // gas overhead eats savings
     const offerAmountB = BigInt(offer.deal.amountB);
-    const out = (offerAmountB * take) / offerAmountA;
     peerLegs.push({
       source: "peer",
       offer,
-      amount_in_wei: take.toString(),
-      amount_out_wei: out.toString(),
+      amount_in_wei: offerAmountA.toString(),
+      amount_out_wei: offerAmountB.toString(),
+      display: {
+        amount_in: formatUnitsBigInt(offerAmountA, userInToken.decimals),
+        amount_out: formatUnitsBigInt(offerAmountB, userOutToken.decimals),
+        token_in_symbol: userInToken.symbol,
+        token_out_symbol: userOutToken.symbol,
+      },
     });
-    remaining -= take;
+    remaining -= offerAmountA;
   }
 
   // Uniswap tail (if remaining > 0)
@@ -876,6 +1080,12 @@ async function computeRoutingPlan(
         prepared: tailFb.value,
         amount_in_wei: parseUnitsBigInt(tailFb.value.expectedInput, userInToken.decimals).toString(),
         amount_out_wei: parseUnitsBigInt(tailFb.value.expectedOutput, userOutToken.decimals).toString(),
+        display: {
+          amount_in: tailFb.value.expectedInput,
+          amount_out: tailFb.value.expectedOutput,
+          token_in_symbol: userInToken.symbol,
+          token_out_symbol: userOutToken.symbol,
+        },
       };
     }
   }
@@ -889,6 +1099,12 @@ async function computeRoutingPlan(
         prepared: pureFb.value,
         amount_in_wei: parseUnitsBigInt(pureFb.value.expectedInput, userInToken.decimals).toString(),
         amount_out_wei: parseUnitsBigInt(pureFb.value.expectedOutput, userOutToken.decimals).toString(),
+        display: {
+          amount_in: pureFb.value.expectedInput,
+          amount_out: pureFb.value.expectedOutput,
+          token_in_symbol: userInToken.symbol,
+          token_out_symbol: userOutToken.symbol,
+        },
       }
     : null;
 
@@ -919,17 +1135,23 @@ async function computeRoutingPlan(
     );
   }
 
-  // Best-peer-only alternative when top peer covers the full intent
+  // Best-peer-only alternative — only when top peer covers the EXACT
+  // intent amount (we can't take less than the signed deal locks).
   const top = sorted[0];
-  if (top && BigInt(top.deal.amountA) >= intentAmountWei) {
+  if (top && BigInt(top.deal.amountA) === intentAmountWei) {
+    const topAmountA = BigInt(top.deal.amountA);
+    const topAmountB = BigInt(top.deal.amountB);
     const onlyLeg: PeerLeg = {
       source: "peer",
       offer: top,
-      amount_in_wei: intentAmountWei.toString(),
-      amount_out_wei: (
-        (BigInt(top.deal.amountB) * intentAmountWei) /
-        BigInt(top.deal.amountA)
-      ).toString(),
+      amount_in_wei: topAmountA.toString(),
+      amount_out_wei: topAmountB.toString(),
+      display: {
+        amount_in: formatUnitsBigInt(topAmountA, userInToken.decimals),
+        amount_out: formatUnitsBigInt(topAmountB, userOutToken.decimals),
+        token_in_symbol: userInToken.symbol,
+        token_out_symbol: userOutToken.symbol,
+      },
     };
     candidates.push(
       buildPlan([onlyLeg], "pure_peer", uniswapBaseline, "alternative"),
@@ -1051,5 +1273,5 @@ process.stderr.write(
   "[og-mcp] connected (resolve_mm, read_mm_reputation, read_user_reputation, " +
     "write_trade_record, read_trade_history, prepare_fallback_swap, " +
     "get_uniswap_reference_quote, read_settlement_state, read_wallet_balance, " +
-    "compute_routing_plan)\n",
+    "compute_routing_plan, validate_token, list_known_tokens)\n",
 );

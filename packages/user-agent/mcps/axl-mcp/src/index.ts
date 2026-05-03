@@ -253,6 +253,54 @@ const TOKEN_BY_SYMBOL: Record<string, TokenSpec> = {
   ETH:  { chain_id: 11155111, address: SEPOLIA_WETH, symbol: "WETH", decimals: 18 },
 };
 
+/** Phase 10: resolve a TokenRef from either explicit (address, decimals)
+ *  fields OR fall back to the legacy symbol-only lookup table. Both
+ *  modes return the same `TokenSpec` shape so the rest of build_intent
+ *  doesn't need to know which path was taken. */
+function resolveTokenRef(
+  symbol: string,
+  address?: string,
+  decimals?: number,
+): { ok: true; value: TokenSpec } | { ok: false; error: string } {
+  if (address !== undefined) {
+    if (decimals === undefined) {
+      return {
+        ok: false,
+        error: `${symbol}: when an explicit address is provided, decimals is required (call mcp_parley_og_validate_token first to read decimals from the contract).`,
+      };
+    }
+    return {
+      ok: true,
+      value: {
+        chain_id: 11155111,
+        address: address.toLowerCase() as Hex,
+        symbol,
+        decimals,
+      },
+    };
+  }
+  const legacy = TOKEN_BY_SYMBOL[symbol.toUpperCase()];
+  if (!legacy) {
+    return {
+      ok: false,
+      error: `unknown token symbol "${symbol}". Either pass an explicit address+decimals (Phase 10 multi-token), or use one of the canonical symbols: ${Object.keys(TOKEN_BY_SYMBOL).join(", ")}.`,
+    };
+  }
+  return { ok: true, value: legacy };
+}
+
+function errorResult(code: string, message: string) {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify({ ok: false, error: code, message }, null, 2),
+      },
+    ],
+    isError: true,
+  };
+}
+
 function uuidv4(): string {
   // Avoid pulling in a uuid dep for one call. RFC4122 v4 manual implementation.
   const bytes = new Uint8Array(16);
@@ -275,11 +323,20 @@ server.registerTool(
   "build_intent",
   {
     description:
-      "Construct a complete `Intent` envelope from user-facing inputs. Resolves token symbols (USDC, WETH, ETH→WETH) to Sepolia addresses, mints a fresh `id` (UUID v4), reads `from_axl_pubkey` from this AXL node's /topology, sets `timestamp`/`privacy`/`signature` defaults, and stamps `agent_id` from `user_wallet`. Returns { ok:true, intent } on success, { ok:false, error } otherwise. **Always call this before /authorize-intent and broadcast_intent — never hand-build the Intent JSON.**",
+      "Construct a complete `Intent` envelope from user-facing inputs. Two modes:\n" +
+      "(1) **Canonical-symbol mode** (Phase 1+): pass `base_symbol` + `quote_symbol` only. Resolves to canonical Sepolia USDC/WETH addresses (`ETH` is treated as a WETH alias).\n" +
+      "(2) **Multi-token mode** (Phase 10): pass `base_symbol` + `base_address` + `base_decimals` (and same for `quote_*`) when the user provided explicit addresses (`swap N FOO(0xaddr) for BAR(0xaddr)` syntax). Use `mcp_parley_og_validate_token` first to read `decimals` and confirm `symbol` from the contract — then pass them in here so the Intent's TokenRefs are correct.\n" +
+      "Mints a fresh `id` (UUID v4), reads `from_axl_pubkey` from this AXL node's /topology, sets `timestamp`/`privacy`/`signature` defaults, and stamps `agent_id` from `user_wallet`. Returns { ok:true, intent } on success. **Always call this before /authorize-intent and broadcast_intent — never hand-build the Intent JSON.**",
     inputSchema: {
       side: z.enum(["buy", "sell"]),
       base_symbol: z.string().min(1),
       quote_symbol: z.string().min(1),
+      // Phase 10: optional explicit address + decimals. When base_address
+      // is provided, base_decimals is required. Same for quote.
+      base_address: z.string().regex(/^0x[0-9a-fA-F]{40}$/).optional(),
+      base_decimals: z.number().int().min(0).max(30).optional(),
+      quote_address: z.string().regex(/^0x[0-9a-fA-F]{40}$/).optional(),
+      quote_decimals: z.number().int().min(0).max(30).optional(),
       amount: z.string().min(1),
       max_slippage_bps: z.number().int().min(0).max(500).default(50),
       timeout_ms: z.number().int().min(10_000).max(600_000).default(60_000),
@@ -291,32 +348,27 @@ server.registerTool(
     side,
     base_symbol,
     quote_symbol,
+    base_address,
+    base_decimals,
+    quote_address,
+    quote_decimals,
     amount,
     max_slippage_bps,
     timeout_ms,
     min_counterparty_rep,
     user_wallet,
   }) => {
-    const base = TOKEN_BY_SYMBOL[base_symbol.toUpperCase()];
-    const quote = TOKEN_BY_SYMBOL[quote_symbol.toUpperCase()];
-    if (!base || !quote) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                ok: false,
-                error: "UNKNOWN_TOKEN",
-                message: `Unknown token symbol(s): base=${base_symbol}, quote=${quote_symbol}. Known: ${Object.keys(TOKEN_BY_SYMBOL).join(", ")}.`,
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-        isError: true,
-      };
+    // Resolve `base` and `quote` TokenRefs. If an explicit address was
+    // provided for either side, Phase 10 multi-token path: build the
+    // TokenRef from (symbol, address, decimals). Otherwise fall through
+    // to the canonical-symbol lookup.
+    const base = resolveTokenRef(base_symbol, base_address, base_decimals);
+    if (!base.ok) {
+      return errorResult("UNKNOWN_TOKEN", `base: ${base.error}`);
+    }
+    const quote = resolveTokenRef(quote_symbol, quote_address, quote_decimals);
+    if (!quote.ok) {
+      return errorResult("UNKNOWN_TOKEN", `quote: ${quote.error}`);
     }
 
     let fromAxlPubkey: string;
@@ -350,8 +402,8 @@ server.registerTool(
       from_axl_pubkey: fromAxlPubkey,
       timestamp: Math.floor(Date.now() / 1000),
       side,
-      base,
-      quote,
+      base: base.value,
+      quote: quote.value,
       amount,
       max_slippage_bps,
       privacy: "public" as const,

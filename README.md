@@ -238,6 +238,7 @@ The read code path is `og-mcp.read_mm_reputation` / `read_user_reputation`; the 
 | 7 | Second MM Agent + competitive offer cards | ✅ done |
 | 8 | MM Agent live Uniswap reference pricing | ✅ done |
 | 9 | Smart routing — partial fills + multi-leg execution | ✅ done |
+| 10 | Multi-token support (per-MM token allowlist) | ✅ done |
 
 ## Running it
 

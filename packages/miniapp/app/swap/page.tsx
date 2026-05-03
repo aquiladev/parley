@@ -13,7 +13,7 @@
 
 "use client";
 
-import { Suspense, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import {
   useAccount,
   useConnect,
@@ -35,9 +35,17 @@ import {
 
 const ERC20_ABI = parseAbi([
   "function approve(address spender, uint256 amount) returns (bool)",
+  "function allowance(address owner, address spender) view returns (uint256)",
 ]);
 
 const MAX_UINT256 = (1n << 256n) - 1n;
+
+// We approve MAX_UINT256 on the first swap; on every subsequent swap the
+// remaining allowance is still astronomically large (any realistic single
+// swap consumes < 1e25 wei). If the on-chain allowance exceeds this
+// threshold, we know a prior max-approve is in place and the user
+// shouldn't have to re-approve. Threshold 2^200 ≈ 1.6e60.
+const PRIOR_MAX_APPROVE_THRESHOLD = 1n << 200n;
 
 type Step = "idle" | "approving" | "swapping" | "confirming" | "done";
 
@@ -90,12 +98,46 @@ function SwapInner() {
     }
   })();
 
-  const needsApproval = Boolean(
+  // URL says approval is needed (token + spender provided). Whether an
+  // approve TX is ACTUALLY needed depends on the on-chain allowance —
+  // see the useEffect below that checks it and sets needsApproveTx.
+  const approvalConfigured = Boolean(
     approvalToken &&
       approvalSpender &&
       /^0x[0-9a-fA-F]{40}$/.test(approvalToken) &&
       /^0x[0-9a-fA-F]{40}$/.test(approvalSpender),
   );
+  // null until we've read on-chain allowance once.
+  const [needsApproveTx, setNeedsApproveTx] = useState<boolean | null>(null);
+
+  // Read current allowance once the wallet is connected. If a prior
+  // max-approve is already in place, skip the approve tx — saves a
+  // confirmation, eliminates the "why is it asking again?" friction.
+  useEffect(() => {
+    if (!approvalConfigured || !publicClient || !address || !approvalToken || !approvalSpender) {
+      setNeedsApproveTx(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const allowance = (await publicClient.readContract({
+          address: approvalToken,
+          abi: ERC20_ABI,
+          functionName: "allowance",
+          args: [address, approvalSpender],
+        })) as bigint;
+        if (cancelled) return;
+        setNeedsApproveTx(allowance < PRIOR_MAX_APPROVE_THRESHOLD);
+      } catch {
+        // RPC blip or unsupported. Default to safe (require approve).
+        if (!cancelled) setNeedsApproveTx(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [approvalConfigured, publicClient, address, approvalToken, approvalSpender]);
 
   async function submit() {
     if (!to || !data) return;
@@ -105,7 +147,7 @@ function SwapInner() {
         await switchChainAsync({ chainId: SEPOLIA_CHAIN_ID });
       }
 
-      if (needsApproval && approvalToken && approvalSpender) {
+      if (needsApproveTx && approvalToken && approvalSpender) {
         setStep("approving");
         // Pre-fill gas params (see lib/gas-estimator.ts).
         const approveOverrides = publicClient && address
@@ -238,13 +280,19 @@ function SwapInner() {
         </div>
       )}
 
-      {needsApproval && (
+      {approvalConfigured && needsApproveTx === true && (
         <p style={{ fontSize: 13, color: "var(--parley-hint)" }}>
-          A Permit2 approval is required first. Two transactions total.
+          An ERC-20 approval is required first (one-time, max-allowance).
+          Two transactions total.
+        </p>
+      )}
+      {approvalConfigured && needsApproveTx === false && (
+        <p style={{ fontSize: 13, color: "var(--parley-hint)" }}>
+          Token already approved — single transaction.
         </p>
       )}
 
-      <button onClick={submit} disabled={step !== "idle"} style={btn}>
+      <button onClick={submit} disabled={step !== "idle" || (approvalConfigured && needsApproveTx === null)} style={btn}>
         {step === "approving"
           ? "Approving token…"
           : step === "swapping"
@@ -253,9 +301,11 @@ function SwapInner() {
               ? "Waiting for confirmation…"
               : step === "done"
                 ? "Done ✓"
-                : needsApproval
-                  ? "Approve and swap"
-                  : "Submit swap"}
+                : approvalConfigured && needsApproveTx === null
+                  ? "Checking allowance…"
+                  : needsApproveTx
+                    ? "Approve and swap"
+                    : "Submit swap"}
       </button>
 
       {approvalTx && (

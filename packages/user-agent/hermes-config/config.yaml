@@ -55,10 +55,20 @@ mcp_servers:
       # Required by `read_settlement_state` so the agent can poll for
       # MM-side lock + settle state without an event subscription.
       SETTLEMENT_CONTRACT_ADDRESS: "${SETTLEMENT_CONTRACT_ADDRESS}"
-      # Required by `read_wallet_balance` (the /balance command). Same
+      # Required by `read_wallet_balance` (the `balance` command). Same
       # canonical Sepolia addresses the MM Agent quotes against.
       SEPOLIA_USDC_ADDRESS: "${SEPOLIA_USDC_ADDRESS}"
       SEPOLIA_WETH_ADDRESS: "${SEPOLIA_WETH_ADDRESS}"
+      # Phase 10: extend `read_wallet_balance` beyond the canonical
+      # USDC/WETH pair. The tool reads `balanceOf` for every token in the
+      # combined registry below (deduped by address). MM_TOKEN_ADDRESSES
+      # is the operator's MM allowlist; KNOWN_TOKENS is an optional
+      # User-Agent-only override if /balance should display a different
+      # set than the MMs quote on. Same SYMBOL:address:decimals,…
+      # format as MM_TOKEN_ADDRESSES. Either being unset is fine —
+      # legacy single-pair deployments still work.
+      MM_TOKEN_ADDRESSES: "${MM_TOKEN_ADDRESSES}"
+      KNOWN_TOKENS: "${KNOWN_TOKENS}"
   parley_axl:
     command: "node"
     args:

@@ -19,7 +19,6 @@ import type {
   Offer,
   OfferDecline,
   ParleyMessage,
-  TokenRef,
   TradeRecord,
 } from "@parley/shared";
 
@@ -30,16 +29,23 @@ import {
   fetchInventoryFromChain,
   loadReserveLimitsFromEnv,
   reservedOutflows,
+  type Inventory,
 } from "./inventory.js";
 import {
   buildOffer,
   digest,
   lockMMSide,
   signDeal,
+  type DeclineReason,
   type NegotiatorConfig,
   type PreparedOffer,
 } from "./negotiator.js";
 import { ReputationPublisher } from "./reputation-publisher.js";
+import {
+  loadRegistryFromEnv,
+  type MmTokenRegistry,
+  type SupportedToken,
+} from "./token-registry.js";
 import {
   createUniswapReference,
   type ReferencePair,
@@ -73,7 +79,6 @@ interface Env {
   settlementContract: Hex;
   chainId: number;
   privateKey: Hex;
-  spreadBps: number;
   ensName: string;
   offerExpiryMs: number;
   settlementWindowMs: number;
@@ -82,7 +87,11 @@ interface Env {
   /** Hard staleness gate — decline-to-quote if the cached price is older
    *  than this when an intent arrives. */
   priceMaxStaleMs: number;
-  knownTokens: { usdc: TokenRef; weth: TokenRef };
+  /** Phase 10: per-MM token + pair allowlist with per-pair spread
+   *  overrides. Replaces hardcoded knownTokens.{usdc,weth} + spreadBps.
+   *  When MM_TOKEN_ADDRESSES is unset, falls back to a USDC/WETH-only
+   *  registry built from SEPOLIA_USDC_ADDRESS / SEPOLIA_WETH_ADDRESS. */
+  registry: MmTokenRegistry;
 }
 
 function readEnv(): Env {
@@ -97,27 +106,34 @@ function readEnv(): Env {
     throw new Error("SETTLEMENT_CONTRACT_ADDRESS is the zero address — deploy first");
   }
 
-  const usdcAddr = (process.env["SEPOLIA_USDC_ADDRESS"] ??
-    "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238") as Hex;
-  const wethAddr = (process.env["SEPOLIA_WETH_ADDRESS"] ??
-    "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14") as Hex;
+  // Make sure SEPOLIA_RPC_URL is set before building the registry; the
+  // registry doesn't need RPC but the wallet/refresher do.
+  const rpcUrl = required("SEPOLIA_RPC_URL");
+
+  const registry = loadRegistryFromEnv();
+  if (registry.tokens.size === 0) {
+    throw new Error(
+      "MM_TOKEN_ADDRESSES yields zero tokens — operator must configure at least one pair",
+    );
+  }
+  if (registry.listPairs().length === 0) {
+    throw new Error(
+      "MM_SUPPORTED_PAIRS yields zero pairs — operator must list at least one allowed pair",
+    );
+  }
 
   return {
     axlHttpUrl: process.env["AXL_HTTP_URL"] ?? "http://localhost:9012",
-    rpcUrl: required("SEPOLIA_RPC_URL"),
+    rpcUrl,
     settlementContract,
     chainId: 11155111,
     privateKey: required("MM_EVM_PRIVATE_KEY") as Hex,
-    spreadBps: Number(process.env["MM_SPREAD_BPS"] ?? "20"),
     ensName: process.env["MM_ENS_NAME"] ?? "mm-1.parley.eth",
     offerExpiryMs: Number(process.env["MM_OFFER_EXPIRY_MS"] ?? "300000"),
     settlementWindowMs: Number(process.env["MM_SETTLEMENT_WINDOW_MS"] ?? "300000"),
     priceRefreshIntervalMs: Number(process.env["MM_PRICE_REFRESH_INTERVAL_MS"] ?? "15000"),
     priceMaxStaleMs: Number(process.env["MM_PRICE_MAX_STALE_MS"] ?? "60000"),
-    knownTokens: {
-      usdc: { chain_id: 11155111, address: usdcAddr, symbol: "USDC", decimals: 6 },
-      weth: { chain_id: 11155111, address: wethAddr, symbol: "WETH", decimals: 18 },
-    },
+    registry,
   };
 }
 
@@ -160,20 +176,17 @@ async function main(): Promise<void> {
     privateKey: env.privateKey,
   });
 
-  const limits = loadReserveLimitsFromEnv({
-    usdcDecimals: env.knownTokens.usdc.decimals,
-    wethDecimals: env.knownTokens.weth.decimals,
-  });
+  const tokens: SupportedToken[] = Array.from(env.registry.tokens.values());
+  const limits = loadReserveLimitsFromEnv(tokens);
 
   const cfg: NegotiatorConfig = {
     mmEnsName: env.ensName,
     mmAddress: account.address,
-    spreadBps: env.spreadBps,
     settlementContract: env.settlementContract,
     chainId: env.chainId,
     privateKey: env.privateKey,
     limits,
-    knownTokens: env.knownTokens,
+    registry: env.registry,
     offerExpiryMs: env.offerExpiryMs,
     settlementWindowMs: env.settlementWindowMs,
   };
@@ -190,20 +203,29 @@ async function main(): Promise<void> {
   const startingInventory = await fetchInventoryFromChain(
     wallet.publicClient,
     account.address,
-    env.knownTokens,
+    tokens,
   );
 
   const topo = await axl.topology();
+  // Phase 10: log per-token balances + reserves and the supported pair set
+  // so the operator can verify the registry parsed correctly.
+  const balances: Record<string, string> = {};
+  const reserves: Record<string, string> = {};
+  for (const t of tokens) {
+    balances[t.symbol] = (startingInventory.get(t.address.toLowerCase() as Hex) ?? 0n).toString();
+    reserves[t.symbol] = (limits.get(t.address.toLowerCase() as Hex) ?? 0n).toString();
+  }
   log({
     event: "boot",
     mm_address: account.address,
     ens_name: env.ensName,
     settlement: env.settlementContract,
-    spread_bps: env.spreadBps,
-    on_chain_balance_usdc_wei: startingInventory.usdc.toString(),
-    on_chain_balance_weth_wei: startingInventory.weth.toString(),
-    min_usdc_reserve_wei: limits.min_usdc.toString(),
-    min_weth_reserve_wei: limits.min_weth.toString(),
+    default_spread_bps: env.registry.defaultSpreadBps,
+    supported_pairs: env.registry.listPairs().map((p) =>
+      `${env.registry.getToken(p.tokenA)?.symbol}/${env.registry.getToken(p.tokenB)?.symbol}`,
+    ),
+    on_chain_balance_wei: balances,
+    reserve_wei: reserves,
     axl_url: env.axlHttpUrl,
     axl_pubkey: topo.ourPublicKey,
     axl_peers: topo.peers.length,
@@ -237,22 +259,32 @@ async function main(): Promise<void> {
     throw err;
   }
 
-  // Phase 8: live Uniswap reference price. Background-refreshes the
-  // mid-price for the WETH/USDC pair; intent path reads synchronously
-  // from the in-memory cache. start() blocks on the first fetch so we
-  // either boot with a warm cache (happy path) or boot logged-but-empty
-  // (RPC unreachable; the MM declines-to-quote until self-heal). Either
-  // way, no per-intent RPC latency.
-  const referencePair: ReferencePair = {
-    tokenIn: env.knownTokens.weth.address,
-    tokenOut: env.knownTokens.usdc.address,
-    decimalsIn: env.knownTokens.weth.decimals,
-    decimalsOut: env.knownTokens.usdc.decimals,
-  };
+  // Phase 10: live Uniswap reference for every supported direction. The
+  // background refresher fetches a no-fee mid-price for each (tokenIn,
+  // tokenOut) the MM is configured to quote. Intent path reads
+  // synchronously from the in-memory cache, keyed by the user's actual
+  // direction (no inversion math). start() blocks on the first fetch
+  // cycle so a healthy MM begins accepting intents with a warm cache.
+  const directions: ReferencePair[] = env.registry.listDirections().map((d) => {
+    const tIn = env.registry.getToken(d.tokenIn);
+    const tOut = env.registry.getToken(d.tokenOut);
+    if (!tIn || !tOut) {
+      // Should be impossible — listDirections derives from registry tokens.
+      throw new Error(
+        `Internal error: registry direction references unknown token (${d.tokenIn} / ${d.tokenOut})`,
+      );
+    }
+    return {
+      tokenIn: tIn.address,
+      tokenOut: tOut.address,
+      decimalsIn: tIn.decimals,
+      decimalsOut: tOut.decimals,
+    };
+  });
   const reference = createUniswapReference({
     client: wallet.publicClient,
     chainId: env.chainId,
-    pair: referencePair,
+    directions,
     refreshIntervalMs: env.priceRefreshIntervalMs,
     log,
   });
@@ -276,7 +308,6 @@ async function main(): Promise<void> {
             axl,
             pending,
             reference,
-            referencePair,
             env.priceMaxStaleMs,
           );
         } else {
@@ -303,7 +334,6 @@ async function dispatch(
   axl: AxlClient,
   pending: Map<string, PendingDeal>,
   reference: UniswapReference,
-  referencePair: ReferencePair,
   priceMaxStaleMs: number,
 ): Promise<void> {
   try {
@@ -317,7 +347,6 @@ async function dispatch(
           axl,
           pending,
           reference,
-          referencePair,
           priceMaxStaleMs,
         );
         break;
@@ -340,30 +369,63 @@ async function handleIntent(
   axl: AxlClient,
   pending: Map<string, PendingDeal>,
   reference: UniswapReference,
-  referencePair: ReferencePair,
   priceMaxStaleMs: number,
 ): Promise<void> {
   log({
     event: "intent_received",
     intent_id: intent.id,
     side: intent.side,
+    base: intent.base.address,
+    quote: intent.quote.address,
     from_header: fromPeerId,
     from_field: intent.from_axl_pubkey,
   });
 
-  // Synchronous cache read — no RPC on the intent path. If the background
-  // refresher hasn't produced a value yet (RPC unreachable at boot) or
-  // the cached value has aged past the staleness gate, we DECLINE to
-  // quote rather than emit a stale price. The User Agent's existing
-  // "fewer offers than expected → fall through to Uniswap fallback"
-  // flow handles silence cleanly.
-  const cached = reference.read(referencePair);
+  // Phase 10: resolve the user's direction (which token they give, which
+  // they receive) so we can look up the right cached price. The MM
+  // registry rejects unsupported tokens / pairs upfront — no point even
+  // checking the price cache if we can't quote on this pair.
+  const userInAddr = (intent.side === "sell" ? intent.base.address : intent.quote.address) as Hex;
+  const userOutAddr = (intent.side === "sell" ? intent.quote.address : intent.base.address) as Hex;
+  const userInToken = cfg.registry.getToken(userInAddr);
+  const userOutToken = cfg.registry.getToken(userOutAddr);
+  if (!userInToken || !userOutToken) {
+    log({
+      event: "offer_declined",
+      reason: "unsupported_token",
+      intent_id: intent.id,
+      base: intent.base.address,
+      quote: intent.quote.address,
+    });
+    await sendDecline(axl, intent, cfg, "unsupported_token");
+    return;
+  }
+  if (!cfg.registry.isSupportedPair(userInToken.address, userOutToken.address)) {
+    log({
+      event: "offer_declined",
+      reason: "unsupported_pair",
+      intent_id: intent.id,
+      pair: `${userInToken.symbol}/${userOutToken.symbol}`,
+    });
+    await sendDecline(axl, intent, cfg, "unsupported_pair");
+    return;
+  }
+
+  // Synchronous cache read for THIS direction — no RPC on the intent
+  // path. Per-direction caching avoids inverse-rate precision loss.
+  const cached = reference.read({
+    tokenIn: userInToken.address,
+    tokenOut: userOutToken.address,
+    decimalsIn: userInToken.decimals,
+    decimalsOut: userOutToken.decimals,
+  });
   const cacheAge = cached ? Date.now() - cached.fetchedAt : null;
   if (cached === null || cacheAge === null || cacheAge > priceMaxStaleMs) {
     log({
       event: "offer_declined",
       reason: "price_unavailable",
       intent_id: intent.id,
+      pair: `${userInToken.symbol}/${userOutToken.symbol}`,
       cache_age_ms: cacheAge,
       max_stale_ms: priceMaxStaleMs,
     });
@@ -372,20 +434,17 @@ async function handleIntent(
   }
 
   // Live chain read — the source of truth for what we actually have to trade.
-  // Decouples quoting decisions from any env-driven cap so a cold restart
-  // with the same hot wallet picks up exactly where the chain says we are.
-  const chainInventory = await fetchInventoryFromChain(
+  const chainInventory: Inventory = await fetchInventoryFromChain(
     wallet.publicClient,
     cfg.mmAddress,
-    cfg.knownTokens,
+    Array.from(cfg.registry.tokens.values()),
   );
 
   // Phase 9 reservation: subtract outflows promised on still-live offers
-  // (signed but not yet settled/refunded). Without this, two concurrent
+  // (signed but not yet settled/refunded). Without this, concurrent
   // intents from different users get quoted against the same chain
-  // balance and the MM accepts more than it can deliver. The MM's main
-  // loop is single-threaded so `pending.set` always completes before
-  // the next handleIntent reads it — no lock needed.
+  // balance and the MM accepts more than it can deliver. Single-threaded
+  // event loop serializes pending.set / reservedOutflows reads.
   const reserved = reservedOutflows(
     Array.from(pending.values(), (p) => ({
       outflow: p.outflow,
@@ -395,27 +454,23 @@ async function handleIntent(
   );
   const available = applyReservations(chainInventory, reserved);
 
-  const prepared = buildOffer(intent, available, cached.value, cfg);
-  if (!prepared) {
+  const result = buildOffer(intent, available, cached.value, cfg);
+  if (typeof result === "string") {
+    // DeclineReason — emit log + decline AXL message and exit.
     log({
-      event: "intent_skipped",
+      event: "offer_declined",
+      reason: result,
       intent_id: intent.id,
-      reason: "unsupported_pair_or_insufficient_balance",
-      on_chain_balance_usdc_wei: chainInventory.usdc.toString(),
-      on_chain_balance_weth_wei: chainInventory.weth.toString(),
-      reserved_usdc_wei: reserved.usdc.toString(),
-      reserved_weth_wei: reserved.weth.toString(),
-      available_usdc_wei: available.usdc.toString(),
-      available_weth_wei: available.weth.toString(),
+      pair: `${userInToken.symbol}/${userOutToken.symbol}`,
+      out_token: userOutToken.symbol,
+      chain_balance_out_wei: (chainInventory.get(userOutToken.address) ?? 0n).toString(),
+      reserved_out_wei: (reserved.get(userOutToken.address) ?? 0n).toString(),
+      available_out_wei: (available.get(userOutToken.address) ?? 0n).toString(),
     });
-    await sendDecline(
-      axl,
-      intent,
-      cfg,
-      "unsupported_pair_or_insufficient_balance",
-    );
+    await sendDecline(axl, intent, cfg, result);
     return;
   }
+  const prepared: PreparedOffer = result;
 
   const sig = await signDeal(prepared.deal, cfg);
   const offer: Offer = { ...prepared.offer, signature: sig };
@@ -609,7 +664,7 @@ async function sweepPending(
       if (onchainState === STATE_NONE) {
         if (now >= p.deal.deadline) {
           // User accepted but never locked → §7.3 "failed acceptance".
-          await recordTerminal(p, reputation, {
+          recordTerminal(p, reputation, {
             settled: false,
             defaulted: "user",
           });
@@ -657,14 +712,14 @@ async function sweepPending(
       if (onchainState === STATE_SETTLED) {
         if (p.user_locked_at === null) p.user_locked_at = now;
         if (p.mm_locked_at === null) p.mm_locked_at = now;
-        await recordTerminal(p, reputation, { settled: true, defaulted: "none" });
+        recordTerminal(p, reputation, { settled: true, defaulted: "none" });
         p.state = "recorded";
         pending.delete(offerId);
         continue;
       }
       if (onchainState === STATE_REFUNDED) {
         if (p.user_locked_at === null) p.user_locked_at = now;
-        await recordTerminal(p, reputation, {
+        recordTerminal(p, reputation, {
           settled: false,
           defaulted: p.mm_locked_at === null ? "mm" : "timeout",
         });
@@ -677,13 +732,13 @@ async function sweepPending(
     // ---- mm_submitted ----------------------------------------------------
     if (p.state === "mm_submitted") {
       if (onchainState === STATE_SETTLED) {
-        await recordTerminal(p, reputation, { settled: true, defaulted: "none" });
+        recordTerminal(p, reputation, { settled: true, defaulted: "none" });
         p.state = "recorded";
         pending.delete(offerId);
         continue;
       }
       if (onchainState === STATE_REFUNDED) {
-        await recordTerminal(p, reputation, { settled: false, defaulted: "timeout" });
+        recordTerminal(p, reputation, { settled: false, defaulted: "timeout" });
         p.state = "recorded";
         pending.delete(offerId);
         continue;
@@ -691,7 +746,7 @@ async function sweepPending(
       if (onchainState === STATE_BOTH_LOCKED && now >= p.deal.deadline) {
         // Both locked but settle never landed before deadline. Caller could
         // refund either side; from our side we're done.
-        await recordTerminal(p, reputation, { settled: false, defaulted: "timeout" });
+        recordTerminal(p, reputation, { settled: false, defaulted: "timeout" });
         p.state = "recorded";
         pending.delete(offerId);
         continue;
@@ -701,12 +756,25 @@ async function sweepPending(
   }
 }
 
-/** Build a TradeRecord from PendingDeal state, publish via 0G Storage + ENS. */
-async function recordTerminal(
+/** Build a TradeRecord from PendingDeal state and kick off a fire-and-forget
+ *  publish via 0G Storage + ENS.
+ *
+ *  Returns synchronously after queuing the publish — the actual upload runs
+ *  in the background and can take minutes on 0G testnet (storage node sync
+ *  lag). Awaiting it here would block the entire sweepPending loop, which
+ *  also dispatches incoming intents — i.e. one slow upload would silently
+ *  stop the MM from quoting until 0G caught up. The trade has already
+ *  settled on chain by this point; the publish is reputation bookkeeping
+ *  and is allowed to race the next intent.
+ *
+ *  Concurrency is owned by ReputationPublisher's internal mutex
+ *  (publishLock), so back-to-back terminal trades publish in order even
+ *  when called fire-and-forget. */
+function recordTerminal(
   p: PendingDeal,
   reputation: ReputationPublisher,
   outcome: { settled: boolean; defaulted: TradeRecord["defaulted"] },
-): Promise<void> {
+): void {
   const record: TradeRecord = {
     trade_id: p.dealHashHex,
     timestamp: Math.floor(Date.now() / 1000),
@@ -732,22 +800,24 @@ async function recordTerminal(
     settled: outcome.settled,
     defaulted: outcome.defaulted,
   });
-  try {
-    const r = await reputation.publish(record);
-    log({
-      event: "trade_record_published",
-      deal_hash: p.dealHashHex,
-      record_root: r.recordHash,
-      index_root: r.indexHash,
-      ens_tx: r.ensTx,
-    });
-  } catch (err) {
-    log({
-      event: "trade_record_publish_error",
-      deal_hash: p.dealHashHex,
-      err: (err as Error).message,
-    });
-  }
+  void (async () => {
+    try {
+      const r = await reputation.publish(record);
+      log({
+        event: "trade_record_published",
+        deal_hash: p.dealHashHex,
+        record_root: r.recordHash,
+        index_root: r.indexHash,
+        ens_tx: r.ensTx,
+      });
+    } catch (err) {
+      log({
+        event: "trade_record_publish_error",
+        deal_hash: p.dealHashHex,
+        err: (err as Error).message,
+      });
+    }
+  })();
 }
 
 async function ensureMmFundedAndApproved(
@@ -763,10 +833,12 @@ async function ensureMmFundedAndApproved(
   // re-running this function on each new fund would be redundant since
   // unlimited approve is already in place.
 
-  const tokens: Array<{ token: Hex; symbol: string }> = [
-    { token: cfg.knownTokens.usdc.address, symbol: "USDC" },
-    { token: cfg.knownTokens.weth.address, symbol: "WETH" },
-  ];
+  const tokens: Array<{ token: Hex; symbol: string; decimals: number }> =
+    Array.from(cfg.registry.tokens.values()).map((t) => ({
+      token: t.address,
+      symbol: t.symbol,
+      decimals: t.decimals,
+    }));
 
   for (const t of tokens) {
     let balance = (await wallet.publicClient.readContract({
@@ -781,7 +853,9 @@ async function ensureMmFundedAndApproved(
     // real Sepolia USDC/WETH where it's not authorized. No-throw on revert
     // because real-token failure isn't an error condition for production.
     if (balance === 0n) {
-      const probeMintAmount = t.symbol === "USDC" ? 10_000_000_000n : 10_000_000_000_000_000_000n;
+      // Mint 10 of each token in natural units (10 USDC = 10_000_000 wei
+      // at 6 decimals; 10 UNI = 10_000_000_000_000_000_000 wei at 18).
+      const probeMintAmount = 10n * 10n ** BigInt(t.decimals);
       log({
         event: "attempting_self_mint",
         token: t.token,

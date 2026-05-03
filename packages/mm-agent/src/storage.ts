@@ -1,8 +1,9 @@
 // 0G Storage adapter for the MM Agent.
 //
 // Uploads JSON blobs (TradeRecords + per-MM index blobs) to 0G Storage and
-// returns root hashes. Read path is owned by og-mcp on the User Agent side
-// — the MM doesn't read its own records, just publishes them.
+// returns root hashes. Also reads the MM's own current index blob so the
+// publisher can do read-modify-write against ENS reputation_root (otherwise
+// a container restart with no local persistence would orphan history).
 //
 // Mirrors packages/user-agent/mcps/og-mcp/src/storage.ts. Same createRequire
 // dance for the SDK's CJS/ESM packaging quirk.
@@ -106,24 +107,36 @@ export async function uploadJsonBlob(data: unknown, label = "blob"): Promise<str
   }
 }
 
-/** Read the local index file. Used to reconstruct the index blob on each
- *  new record so og-mcp's MM-side reads can fetch the canonical history
- *  via the ENS reputation_root pointer. */
+/** Shape of the MM's reputation index blob — a chronological list of
+ *  TradeRecord root hashes. ENS `reputation_root` text record points at
+ *  one of these. */
 export interface MmRecordIndex {
-  records: string[]; // chronological list of TradeRecord root hashes
+  records: string[];
 }
 
-export function loadLocalIndex(path: string): MmRecordIndex {
+/** Download an MM index blob by 0G root hash. Used by the publisher to
+ *  read its OWN current index off ENS before appending a new record, so
+ *  history survives container restarts (no local cache at all). */
+export async function fetchIndexBlob(rootHash: string): Promise<MmRecordIndex> {
+  const indexer = getIndexer();
+  const dir = mkdtempSync(join(tmpdir(), "parley-mm-og-dl-"));
+  const path = join(dir, "index.json");
   try {
-    const raw = readFileSync(path, "utf-8");
-    const j = JSON.parse(raw) as MmRecordIndex;
-    if (!Array.isArray(j.records)) return { records: [] };
-    return j;
-  } catch {
-    return { records: [] };
+    const err = await indexer.download(rootHash, path, true);
+    if (err !== null) {
+      throw new Error(`download: ${err}`);
+    }
+    const text = readFileSync(path, "utf-8");
+    const parsed = JSON.parse(text) as unknown;
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      Array.isArray((parsed as MmRecordIndex).records)
+    ) {
+      return parsed as MmRecordIndex;
+    }
+    throw new Error(`index blob ${rootHash} has no "records" array`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
-}
-
-export function saveLocalIndex(path: string, idx: MmRecordIndex): void {
-  writeFileSync(path, JSON.stringify(idx, null, 2));
 }
