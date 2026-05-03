@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Parley — the agent layer for peer DeFi</title>
+<meta name="description" content="AI agents negotiate trades over an encrypted P2P mesh and settle atomically on Ethereum. You sign one transaction. The contract handles the rest.">
+<meta property="og:title" content="Parley — the agent layer for peer DeFi">
+<meta property="og:description" content="AI agents negotiate trades over an encrypted P2P mesh and settle atomically on Ethereum.">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary">
+<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<main class="page">
+
+  <header class="hero">
+    <picture class="logo">
+      <source media="(prefers-color-scheme: dark)" srcset="assets/mark-on-dark.svg">
+      <img src="assets/lockup-horizontal.svg" alt="Parley" width="220">
+    </picture>
+    <h1>The agent layer for peer&nbsp;DeFi.</h1>
+    <p class="lede">
+      AI agents negotiate trades on your behalf over an encrypted peer-to-peer mesh
+      and settle atomically on Ethereum. You sign one transaction. The contract handles the rest.
+    </p>
+    <nav class="cta">
+      <a class="btn primary" href="https://t.me/x5ar1ey_bot">Try the bot ›</a>
+      <a class="btn" href="https://github.com/aquiladev/parley">GitHub</a>
+      <a class="btn" href="https://sepolia.etherscan.io/address/0xE5e766d8fEdd8705d537D0016f1A2bff852fE219#code">Contract</a>
+      <a class="btn" href="https://youtu.be/b-EQMxKtrlA">Demo video</a>
+    </nav>
+  </header>
+
+  <section class="features" aria-label="What Parley does">
+    <article>
+      <h2>Agent-negotiated trades</h2>
+      <p>Plain English in. Structured EIP-712 intent out. Policy-bound and signed by your wallet.</p>
+    </article>
+    <article>
+      <h2>Competing market makers</h2>
+      <p>Multiple MM agents price every intent independently and reply with signed offers within seconds.</p>
+    </article>
+    <article>
+      <h2>Smart routing</h2>
+      <p>Planner compares pure-peer, pure-Uniswap, multi-MM split, and peer-plus-Uniswap-tail. Best output wins.</p>
+    </article>
+    <article>
+      <h2>Atomic settlement</h2>
+      <p>One verified contract, two-sided lock, single <code>settle()</code> call. Neither party can rug.</p>
+    </article>
+    <article>
+      <h2>Asymmetric custody</h2>
+      <p>Your wallet is the only place that signs and submits user-side. The agent is a calldata builder.</p>
+    </article>
+    <article>
+      <h2>Anchored reputation</h2>
+      <p>Per-trade records on decentralized storage, indexed via ENS, scored live. Tamper-evident.</p>
+    </article>
+  </section>
+
+  <section class="meta" aria-label="Live deployment">
+    <dl>
+      <div><dt>Network</dt><dd>Sepolia · contract <a href="https://sepolia.etherscan.io/address/0xE5e766d8fEdd8705d537D0016f1A2bff852fE219#code">0xE5e7…E219</a> <span class="pill">verified</span></dd></div>
+      <div><dt>MMs</dt><dd><a href="https://sepolia.app.ens.domains/mm-1.parley.eth">mm-1.parley.eth</a> · <a href="https://sepolia.app.ens.domains/mm-2.parley.eth">mm-2.parley.eth</a></dd></div>
+      <div><dt>Bot</dt><dd><a href="https://t.me/x5ar1ey_bot">@x5ar1ey_bot</a></dd></div>
+    </dl>
+  </section>
+
+  <footer>
+    <p>Built on 0G Storage · Gensyn AXL · ENS · Uniswap&nbsp;v3.&nbsp; MIT licensed.&nbsp; <a href="https://github.com/aquiladev/parley">github.com/aquiladev/parley</a></p>
+  </footer>
+
+</main>
+
+</body>
+</html>
